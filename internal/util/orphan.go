@@ -58,20 +58,45 @@ func addDescendants(parentPID int, childMap map[int][]int, pids map[int]bool) {
 	}
 }
 
-// getTmuxSessionPIDs returns a set of PIDs belonging to ANY tmux session
-// across ALL tmux sockets on this machine.
+// tmuxProtection holds the tmux PID protection set plus enumeration health.
 //
-// This prevents killing Claude processes that are running in tmux sessions,
-// even if they temporarily show TTY "?" during startup or session transitions.
-//
-// CRITICAL: We protect ALL tmux sessions on ALL sockets. When multiple Gas Town
-// instances run on the same machine, each uses its own tmux socket. A single-socket
-// query would miss processes in other towns' sessions, causing cross-town kills.
-func getTmuxSessionPIDs() map[int]bool {
+// Fail-closed consumers (any code path that signals processes) MUST check
+// failClosed() before acting: when the town's own socket could not be
+// enumerated, the town's live agents are missing from pids, and signaling
+// would turn live work into "orphans" (hq-m4x, 20:49 mass-reap incident).
+type tmuxProtection struct {
+	// pids holds pane PIDs (and their descendants) from every socket that
+	// enumerated successfully.
+	pids map[int]bool
+	// townOK is true only when this town's socket (tmux.BuildCommand
+	// list-panes) enumerated without error. A dead server, stale socket, or
+	// zero-session state all produce an error and set townOK=false.
+	townOK bool
+	// townPanes is the number of panes reported by the town socket (0 when
+	// townOK is false or the server has no sessions).
+	townPanes int
+	// socketFailures counts non-town socket queries that failed. The
+	// protection set is incomplete for those towns (audit only).
+	socketFailures int
+}
+
+// failClosed reports whether cleanup must refuse to signal this cycle: the
+// town's tmux socket enumeration failed, or it reported no panes at all.
+// In either case the protection reference set is empty/unreliable and
+// signaling anything risks reaping live agents.
+func (p tmuxProtection) failClosed() bool {
+	return !p.townOK || p.townPanes == 0
+}
+
+// getTmuxProtection returns the protection set and the enumeration health of
+// this town's socket.
+func getTmuxProtection() tmuxProtection {
 	pids := make(map[int]bool)
 
 	// Build process tree once, shared across all socket scans
 	childMap := buildChildMap()
+
+	socketFailures := 0
 
 	// Scan all tmux sockets in the socket directory.
 	// Each Gas Town instance (and any personal tmux servers) gets its own socket.
@@ -83,31 +108,65 @@ func getTmuxSessionPIDs() map[int]bool {
 				continue
 			}
 			socketPath := filepath.Join(socketDir, entry.Name())
-			collectPanePIDs(socketPath, childMap, pids)
-		}
-	}
-
-	// Also query the current town's socket via BuildCommand as a fallback.
-	// This handles non-standard socket locations (e.g. GT_TMUX_SOCKET override).
-	out, err := tmux.BuildCommand("list-panes", "-a", "-F", "#{pane_pid}").Output()
-	if err == nil {
-		for _, pidStr := range strings.Split(strings.TrimSpace(string(out)), "\n") {
-			if pid, err := strconv.Atoi(pidStr); err == nil && pid > 0 {
-				pids[pid] = true
-				addDescendants(pid, childMap, pids)
+			if !collectPanePIDs(socketPath, childMap, pids) {
+				socketFailures++
 			}
 		}
 	}
 
-	return pids
+	// Query the current town's socket via BuildCommand as a fallback.
+	// This handles non-standard socket locations (e.g. GT_TMUX_SOCKET override).
+	// Success of THIS query is the fail-closed signal: if it fails, the town's
+	// own agents are missing from the protection set.
+	townOK := false
+	townPanes := 0
+	out, err := tmux.BuildCommand("list-panes", "-a", "-F", "#{pane_pid}").Output()
+	if err == nil {
+		townOK = true
+		for _, pidStr := range strings.Split(strings.TrimSpace(string(out)), "\n") {
+			if pid, err := strconv.Atoi(pidStr); err == nil && pid > 0 {
+				pids[pid] = true
+				addDescendants(pid, childMap, pids)
+				townPanes++
+			}
+		}
+	}
+
+	return tmuxProtection{
+		pids:           pids,
+		townOK:         townOK,
+		townPanes:      townPanes,
+		socketFailures: socketFailures,
+	}
+}
+
+// getTmuxSessionPIDs returns a set of PIDs belonging to ANY tmux session
+// across ALL tmux sockets on this machine.
+//
+// This prevents killing Claude processes that are running in tmux sessions,
+// even if they temporarily show TTY "?" during startup or session transitions.
+//
+// CRITICAL: We protect ALL tmux sessions on ALL sockets. When multiple Gas Town
+// instances run on the same machine, each uses its own tmux socket. A single-socket
+// query would miss processes in other towns' sessions, causing cross-town kills.
+//
+// Callers that act on the result (signal processes) must use
+// getTmuxProtection and check failClosed() instead.
+func getTmuxSessionPIDs() map[int]bool {
+	return getTmuxProtection().pids
 }
 
 // collectPanePIDs queries a single tmux socket for all pane PIDs and adds them
 // (plus their descendant processes) to the protection set.
-func collectPanePIDs(socketPath string, childMap map[int][]int, pids map[int]bool) {
+//
+// It reports per-socket success: a false return means the socket query FAILED
+// (dead server, stale socket, ...) and that socket's PIDs are MISSING from the
+// protection set — it does NOT mean the socket has no sessions. Callers must
+// never treat a failure as an empty set.
+func collectPanePIDs(socketPath string, childMap map[int][]int, pids map[int]bool) bool {
 	out, err := exec.Command("tmux", "-S", socketPath, "list-panes", "-a", "-F", "#{pane_pid}").Output()
 	if err != nil {
-		return
+		return false
 	}
 	for _, pidStr := range strings.Split(strings.TrimSpace(string(out)), "\n") {
 		if pid, err := strconv.Atoi(pidStr); err == nil && pid > 0 {
@@ -115,6 +174,7 @@ func collectPanePIDs(socketPath string, childMap map[int][]int, pids map[int]boo
 			addDescendants(pid, childMap, pids)
 		}
 	}
+	return true
 }
 
 // getACPSessionPIDs returns a set of PIDs belonging to active ACP (Agent Client Protocol) sessions.
@@ -676,6 +736,13 @@ type ZombieCleanupResult struct {
 //  2. Next cycle, still alive after grace period → SIGKILL
 //  3. Next cycle, still alive after SIGKILL → log as unkillable
 func CleanupZombieClaudeProcesses() ([]ZombieCleanupResult, error) {
+	// Fail-closed guard (hq-m4x): if the town's tmux socket could not be
+	// enumerated, the protection set is missing this town's live agents.
+	// Skip the entire cycle — no SIGTERM/SIGKILL, no state writes.
+	if p := getTmuxProtection(); p.failClosed() {
+		return nil, fmt.Errorf("zombie cleanup skipped: tmux enumeration failed (fail-closed)")
+	}
+
 	zombies, err := FindZombieClaudeProcesses()
 	if err != nil {
 		return nil, err
@@ -777,6 +844,13 @@ func CleanupZombieClaudeProcesses() ([]ZombieCleanupResult, error) {
 //
 // Returns the list of cleanup results and any error encountered.
 func CleanupOrphanedClaudeProcesses() ([]CleanupResult, error) {
+	// Fail-closed guard (hq-m4x): if the town's tmux socket could not be
+	// enumerated, the protection set is missing this town's live agents.
+	// Skip the entire cycle — no SIGTERM/SIGKILL, no state writes.
+	if p := getTmuxProtection(); p.failClosed() {
+		return nil, fmt.Errorf("orphan cleanup skipped: tmux enumeration failed (fail-closed)")
+	}
+
 	orphans, err := FindOrphanedClaudeProcesses()
 	if err != nil {
 		return nil, err
@@ -899,7 +973,12 @@ func isProcessStillOrphaned(pid int) bool {
 		return false
 	}
 
-	// Re-check against current tmux session PIDs
-	protectedPIDs := getTmuxSessionPIDs()
-	return !protectedPIDs[pid]
+	// Re-check against current tmux session PIDs. Fail closed (hq-m4x):
+	// if the town socket cannot be enumerated right now, the protection set
+	// is incomplete and this PID must NOT be signaled.
+	p := getTmuxProtection()
+	if p.failClosed() {
+		return false
+	}
+	return !p.pids[pid]
 }

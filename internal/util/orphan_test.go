@@ -3,12 +3,14 @@
 package util
 
 import (
+	"bytes"
 	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strconv"
 	"strings"
+	"syscall"
 	"testing"
 
 	"github.com/steveyegge/gastown/internal/tmux"
@@ -147,6 +149,40 @@ func hasTmux() bool {
 	return err == nil
 }
 
+// isolateTmuxSocketDir forces tmux (client commands and spawned servers) to
+// use the canonical /tmp/tmux-<uid> socket directory that tmux.SocketDir()
+// scans, regardless of TMUX_TMPDIR/TMPDIR inherited from the environment.
+//
+// Environments that run tmux under a custom TMUX_TMPDIR (e.g. GT daemon
+// hosts with TMUX_TMPDIR=~/.tmux-tmp) would otherwise create test sockets
+// that the protection-set directory scan never sees, breaking
+// cross-socket assertions. Socket names are PID-unique, so using the
+// canonical directory cannot collide with real town sockets.
+func isolateTmuxSocketDir(t *testing.T) {
+	t.Helper()
+
+	oldTmuxTmpdir, hadTmuxTmpdir := os.LookupEnv("TMUX_TMPDIR")
+	oldTmpdir, hadTmpdir := os.LookupEnv("TMPDIR")
+	if err := os.Unsetenv("TMUX_TMPDIR"); err != nil {
+		t.Fatalf("unsetting TMUX_TMPDIR: %v", err)
+	}
+	if err := os.Setenv("TMPDIR", "/tmp"); err != nil {
+		t.Fatalf("setting TMPDIR: %v", err)
+	}
+	t.Cleanup(func() {
+		if hadTmuxTmpdir {
+			_ = os.Setenv("TMUX_TMPDIR", oldTmuxTmpdir)
+		} else {
+			_ = os.Unsetenv("TMUX_TMPDIR")
+		}
+		if hadTmpdir {
+			_ = os.Setenv("TMPDIR", oldTmpdir)
+		} else {
+			_ = os.Unsetenv("TMPDIR")
+		}
+	})
+}
+
 // tmuxSocketSession creates a session on the given socket and returns the pane PID.
 // The caller must kill the session or server in cleanup.
 func tmuxSocketSession(t *testing.T, socketName, sessionName string) int {
@@ -178,6 +214,7 @@ func TestGetTmuxSessionPIDs_CrossSocket(t *testing.T) {
 	if !hasTmux() {
 		t.Skip("tmux not installed")
 	}
+	isolateTmuxSocketDir(t)
 
 	socketA := fmt.Sprintf("gt-test-orphan-a-%d", os.Getpid())
 	socketB := fmt.Sprintf("gt-test-orphan-b-%d", os.Getpid())
@@ -208,6 +245,7 @@ func TestGetTmuxSessionPIDs_SingleSocket(t *testing.T) {
 	if !hasTmux() {
 		t.Skip("tmux not installed")
 	}
+	isolateTmuxSocketDir(t)
 
 	socket := fmt.Sprintf("gt-test-orphan-single-%d", os.Getpid())
 	t.Cleanup(func() { killTmuxServer(socket) })
@@ -365,5 +403,157 @@ func TestOrphanedProcess_TownRoot_Populated(t *testing.T) {
 				t.Errorf("PID %d: TownRoot %q does not exist on disk", o.PID, o.TownRoot)
 			}
 		}
+	}
+}
+
+// deadTownSocketWithLiveElsewhere simulates the gt-h9z failure mode: the
+// town's socket file is left behind (stale) with no server, while another
+// town's socket has live panes. Returns the live other-town pane PID.
+func deadTownSocketWithLiveElsewhere(t *testing.T, suffix string) (townSocket, otherSocket string, otherPid int) {
+	t.Helper()
+	isolateTmuxSocketDir(t)
+
+	// Town socket: create a real server, then kill it, leaving a stale
+	// socket file (live listener gone, file remains).
+	townSocket = fmt.Sprintf("gt-test-orphan-%s-dead-%d", suffix, os.Getpid())
+	tmuxSocketSession(t, townSocket, "town-session")
+	killTmuxServer(townSocket)
+	t.Cleanup(func() {
+		// Remove the stale socket file so test runs don't accumulate.
+		_ = os.Remove(filepath.Join(tmux.SocketDir(), townSocket))
+	})
+
+	// Another town's socket with a live pane.
+	otherSocket = fmt.Sprintf("gt-test-orphan-%s-other-%d", suffix, os.Getpid())
+	otherPid = tmuxSocketSession(t, otherSocket, "other-session")
+	t.Cleanup(func() { killTmuxServer(otherSocket) })
+
+	oldSocket := tmux.GetDefaultSocket()
+	tmux.SetDefaultSocket(townSocket)
+	t.Cleanup(func() { tmux.SetDefaultSocket(oldSocket) })
+
+	return townSocket, otherSocket, otherPid
+}
+
+// TestGetTmuxProtection_HealthyTownSocket verifies normal behavior: with a
+// live town socket the guard stays open (failClosed == false) and the pane
+// is in the protection set.
+func TestGetTmuxProtection_HealthyTownSocket(t *testing.T) {
+	if !hasTmux() {
+		t.Skip("tmux not installed")
+	}
+	isolateTmuxSocketDir(t)
+
+	socket := fmt.Sprintf("gt-test-orphan-healthy-%d", os.Getpid())
+	t.Cleanup(func() { killTmuxServer(socket) })
+	pid := tmuxSocketSession(t, socket, "session-1")
+
+	oldSocket := tmux.GetDefaultSocket()
+	tmux.SetDefaultSocket(socket)
+	t.Cleanup(func() { tmux.SetDefaultSocket(oldSocket) })
+
+	p := getTmuxProtection()
+
+	if !p.townOK {
+		t.Errorf("townOK = false, want true (healthy town socket)")
+	}
+	if p.townPanes < 1 {
+		t.Errorf("townPanes = %d, want >= 1", p.townPanes)
+	}
+	if !p.pids[pid] {
+		t.Errorf("pane PID %d not in protection set (set size=%d)", pid, len(p.pids))
+	}
+	if p.failClosed() {
+		t.Errorf("failClosed() = true on healthy town socket, want false")
+	}
+}
+
+// TestGetTmuxProtection_DeadTownSocket verifies the gt-h9z failure mode: a
+// stale town socket (file present, no server) marks the town enumeration as
+// failed even when other sockets enumerate live panes.
+func TestGetTmuxProtection_DeadTownSocket(t *testing.T) {
+	if !hasTmux() {
+		t.Skip("tmux not installed")
+	}
+
+	_, _, otherPid := deadTownSocketWithLiveElsewhere(t, "proto")
+
+	p := getTmuxProtection()
+
+	if p.townOK {
+		t.Errorf("townOK = true, want false (dead town socket)")
+	}
+	if p.townPanes != 0 {
+		t.Errorf("townPanes = %d, want 0", p.townPanes)
+	}
+	// Other towns' panes are still collected (read-only consumers keep
+	// working), but the guard must close.
+	if !p.pids[otherPid] {
+		t.Errorf("pane PID %d from live socket not in protection set (set size=%d)", otherPid, len(p.pids))
+	}
+	if !p.failClosed() {
+		t.Errorf("failClosed() = false with dead town socket, want true")
+	}
+}
+
+// TestCleanupOrphanedClaudeProcesses_FailClosedDeadTownSocket is the core
+// hq-m4x regression test: with a dead town socket and live panes elsewhere,
+// cleanup must signal NOTHING — fail-closed error, zero results, live pane
+// untouched, no state writes.
+func TestCleanupOrphanedClaudeProcesses_FailClosedDeadTownSocket(t *testing.T) {
+	if !hasTmux() {
+		t.Skip("tmux not installed")
+	}
+
+	_, _, otherPid := deadTownSocketWithLiveElsewhere(t, "e2e")
+
+	statePath := filepath.Join(stateFileDir(), orphanStateFile)
+	stateBefore, _ := os.ReadFile(statePath) // may not exist
+
+	results, err := CleanupOrphanedClaudeProcesses()
+	if err == nil || !strings.Contains(err.Error(), "fail-closed") {
+		t.Fatalf("CleanupOrphanedClaudeProcesses() error = %v, want fail-closed error", err)
+	}
+	if len(results) != 0 {
+		t.Fatalf("results = %d, want 0 (nothing may be signaled)", len(results))
+	}
+
+	if err := syscall.Kill(otherPid, 0); err != nil {
+		t.Errorf("live pane PID %d from other socket died: %v", otherPid, err)
+	}
+
+	stateAfter, _ := os.ReadFile(statePath)
+	if !bytes.Equal(stateBefore, stateAfter) {
+		t.Errorf("state file %s changed during fail-closed skip", statePath)
+	}
+}
+
+// TestCleanupZombieClaudeProcesses_FailClosedDeadTownSocket verifies the
+// same guard on the zombie-cleanup signaling path.
+func TestCleanupZombieClaudeProcesses_FailClosedDeadTownSocket(t *testing.T) {
+	if !hasTmux() {
+		t.Skip("tmux not installed")
+	}
+
+	_, _, otherPid := deadTownSocketWithLiveElsewhere(t, "ze2e")
+
+	statePath := filepath.Join(stateFileDir(), zombieStateFile)
+	stateBefore, _ := os.ReadFile(statePath) // may not exist
+
+	results, err := CleanupZombieClaudeProcesses()
+	if err == nil || !strings.Contains(err.Error(), "fail-closed") {
+		t.Fatalf("CleanupZombieClaudeProcesses() error = %v, want fail-closed error", err)
+	}
+	if len(results) != 0 {
+		t.Fatalf("results = %d, want 0 (nothing may be signaled)", len(results))
+	}
+
+	if err := syscall.Kill(otherPid, 0); err != nil {
+		t.Errorf("live pane PID %d from other socket died: %v", otherPid, err)
+	}
+
+	stateAfter, _ := os.ReadFile(statePath)
+	if !bytes.Equal(stateBefore, stateAfter) {
+		t.Errorf("state file %s changed during fail-closed skip", statePath)
 	}
 }
