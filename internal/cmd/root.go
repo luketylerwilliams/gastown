@@ -189,13 +189,18 @@ func isRoleCommand(cmd *cobra.Command) bool {
 	return false
 }
 
+// isDoneCommand reports whether cmd is the top-level 'gt done' polecat
+// completion command, which autosaves and pushes and must prove polecat
+// ownership before shared pre-run writes run.
+//
+// Only the exact doneCmd qualifies. Subcommands that merely happen to be
+// named "done" (e.g. 'gt dog done', 'gt wl done') manage their own state
+// and must NOT trigger the polecat-ownership pre-check — doing so made
+// 'gt dog done' fail for every non-polecat actor with "gt done is for
+// polecats only (BD_ACTOR=dog)", leaving dogs stuck in state=working
+// (hq-r3j).
 func isDoneCommand(cmd *cobra.Command) bool {
-	for c := cmd; c != nil; c = c.Parent() {
-		if c.Name() == "done" {
-			return true
-		}
-	}
-	return false
+	return cmd == doneCmd
 }
 
 // initCLITheme initializes the CLI color theme based on settings and environment.
