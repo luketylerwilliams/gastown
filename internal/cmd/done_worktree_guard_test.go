@@ -6,8 +6,6 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
-
-	"github.com/spf13/cobra"
 )
 
 func TestResolveDonePolecatWorktreeAcceptsOwnWorktree(t *testing.T) {
@@ -287,13 +285,23 @@ func TestRunDoneRejectsMayorRigBeforeAutosave(t *testing.T) {
 }
 
 func TestIsDoneCommand(t *testing.T) {
-	done := &cobra.Command{Use: "done"}
-	root := &cobra.Command{Use: "gt"}
-	root.AddCommand(done)
-	if !isDoneCommand(done) {
-		t.Fatal("done command should be detected")
+	// The top-level polecat completion command must be detected.
+	if !isDoneCommand(doneCmd) {
+		t.Fatal("gt done command should be detected")
 	}
-	if isDoneCommand(root) {
+	// Commands named "done" under other parents manage their own state and
+	// must not trigger the polecat-ownership pre-check (hq-r3j: 'gt dog done'
+	// failed for dogs with "gt done is for polecats only (BD_ACTOR=dog)").
+	if isDoneCommand(dogDoneCmd) {
+		t.Fatal("gt dog done should NOT be detected as the polecat done command")
+	}
+	if isDoneCommand(wlDoneCmd) {
+		t.Fatal("gt wl done should NOT be detected as the polecat done command")
+	}
+	if isDoneCommand(dogCmd) {
+		t.Fatal("gt dog parent command should not be detected")
+	}
+	if isDoneCommand(rootCmd) {
 		t.Fatal("root command should not be detected as done")
 	}
 }
@@ -315,7 +323,9 @@ func TestPersistentPreRunDoneRejectsBeforeRegistryFallback(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = os.Chdir(origDir) })
 
-	done := &cobra.Command{Use: "done"}
+	// Use the real doneCmd: the pre-run gate keys off the polecat completion
+	// command itself, not off a synthetic command named "done" (hq-r3j).
+	done := doneCmd
 	err = persistentPreRun(done, nil)
 	if err == nil || !strings.Contains(err.Error(), "assigned polecat worktree") {
 		t.Fatalf("persistentPreRun error = %v, want assigned worktree rejection", err)
