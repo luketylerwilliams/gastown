@@ -181,9 +181,21 @@ func modifyAgentState(agentBead, beadsDir string, hasIncr bool) error {
 		labels[parts[0]] = parts[1]
 	}
 
-	// Apply delete operations
+	// Apply delete operations.
+	// delKey can be either a simple key (e.g., "idle") for single-colon labels,
+	// or a full label (e.g., "gt:maint-test:1") for multi-colon labels.
 	for _, delKey := range agentStateDel {
-		delete(labels, delKey)
+		if _, ok := labels[delKey]; ok {
+			delete(labels, delKey)
+		} else {
+			// Try as a simple key (single-colon label stored as key:value)
+			parts := strings.SplitN(delKey, ":", 2)
+			if len(parts) == 2 {
+				if v, ok := labels[parts[0]]; ok && v == parts[1] {
+					delete(labels, parts[0])
+				}
+			}
+		}
 	}
 
 	// Build final label list: non-state labels + state labels (key:value format)
@@ -198,7 +210,12 @@ func modifyAgentState(agentBead, beadsDir string, hasIncr bool) error {
 
 	// Add state labels from modified map
 	for key, value := range labels {
-		finalLabels = append(finalLabels, key+":"+value)
+		if value == "" {
+			// Multi-colon label stored as full key (e.g., "gt:maint-test:1")
+			finalLabels = append(finalLabels, key)
+		} else {
+			finalLabels = append(finalLabels, key+":"+value)
+		}
 	}
 
 	// Build update command with --set-labels to replace all
@@ -242,12 +259,23 @@ func getAgentLabels(agentBead, beadsDir string) (map[string]string, error) {
 		return nil, err
 	}
 
-	// Parse state labels (those with : separator) into key:value map
+	// Parse state labels (those with : separator) into key:value map.
+	// Labels like "gt:agent" and "gt:maint-test:1" share the prefix "gt"
+	// so a naive SplitN(label, ":", 2) collides. Use the full label as key
+	// with an empty value to preserve all colon-containing labels distinctly.
+	// For true key=value state labels (set via --set key=value), the key is
+	// the part before the FIRST colon and value is the rest — but only when
+	// there is exactly one colon (simple key:value). Multi-colon labels are
+	// stored as full-label keys with empty values.
 	labels := make(map[string]string)
 	for _, label := range allLabels {
-		parts := strings.SplitN(label, ":", 2)
-		if len(parts) == 2 {
+		colons := strings.Count(label, ":")
+		if colons == 1 {
+			parts := strings.SplitN(label, ":", 2)
 			labels[parts[0]] = parts[1]
+		} else if colons > 1 {
+			// Multi-colon label (e.g., "gt:maint-test:1"): store as full key
+			labels[label] = ""
 		}
 	}
 
