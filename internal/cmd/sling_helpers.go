@@ -387,6 +387,30 @@ func verifyBeadExists(beadID string) error {
 	return nil
 }
 
+// getBeadStatus returns the status field of a bead ("open", "closed", "hooked", etc.).
+func getBeadStatus(beadID string) (string, error) {
+	out, err := BdCmd("show", beadID, "--json").Stderr(io.Discard).Output()
+	if err != nil {
+		return "", err
+	}
+	// bd show --json returns a JSON object (or array with one element)
+	type beadJSON struct {
+		Status string `json:"status"`
+	}
+	var b beadJSON
+	raw := strings.TrimSpace(string(out))
+	if strings.HasPrefix(raw, "[") {
+		var arr []beadJSON
+		if err := json.Unmarshal(out, &arr); err == nil && len(arr) > 0 {
+			return arr[0].Status, nil
+		}
+	}
+	if err := json.Unmarshal(out, &b); err != nil {
+		return "", err
+	}
+	return b.Status, nil
+}
+
 // verifyBeadExistsInTargetRigDatabase checks the target rig's beads database
 // directly instead of following prefix routing. This prevents gt sling from
 // spawning polecats or creating molecule/hook side effects for beads that only

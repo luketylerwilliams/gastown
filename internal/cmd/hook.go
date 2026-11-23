@@ -246,6 +246,12 @@ func runHook(_ *cobra.Command, args []string) error {
 		return err
 	}
 
+	// Reject attaching closed beads — re-hooking a closed bead circumvents
+	// the closed-bead refusal in bd update (hq-7hy).
+	if status, err := getBeadStatus(beadID); err == nil && status == "closed" {
+		return fmt.Errorf("bead %q is closed; re-hook a closed bead is not allowed (reopen it first)", beadID)
+	}
+
 	// Determine agent identity (target or self)
 	var agentID string
 	var err error
