@@ -411,9 +411,10 @@ func createCompactReportBead(report *compactReport, markdown string) (string, er
 		return "", fmt.Errorf("parsing report bead id: %w", err)
 	}
 
-	// Auto-close (audit record, not work). Surface failures: if close fails,
-	// the bead stays open and findExistingCompactReport (filter status=closed)
-	// will never match, causing the digest to re-fire every patrol cycle.
+	// Auto-close (audit record, not work). Surface failures so the error is
+	// visible. If close fails the bead stays open, but
+	// findExistingCompactReport scans all statuses, so the digest is not
+	// re-fired on the next cycle.
 	closeCmd := exec.Command("bd", "close", beadID, "--reason=daily compaction report")
 	if out, err := closeCmd.CombinedOutput(); err != nil {
 		return "", fmt.Errorf("auto-closing report bead %s: %w\nOutput: %s", beadID, err, string(out))
@@ -658,11 +659,14 @@ func formatWeeklyRollup(rollup *weeklyRollup) string {
 func findExistingCompactReport(dateStr string) (string, error) {
 	expectedTitle := fmt.Sprintf("Compaction Report %s", dateStr)
 
+	// Scan every status: the bead is normally closed by createCompactReportBead,
+	// but a failed close leaves it open. A closed-only view misses that marker
+	// and the digest re-fires every patrol cycle (same class as hq-h2h).
 	listCmd := exec.Command("bd", "list",
 		"--type=event",
-		"--status=closed",
+		"--all",
 		"--json",
-		"--limit=50",
+		"--limit=100",
 	)
 	listOutput, err := listCmd.Output()
 	if err != nil {
@@ -690,10 +694,14 @@ func findExistingCompactReport(dateStr string) (string, error) {
 func findExistingWeeklyRollup(weekStart, weekEnd string) (string, error) {
 	expectedTitle := fmt.Sprintf("Weekly Compaction Rollup %s to %s", weekStart, weekEnd)
 
+	// The audit bead is auto-closed right after creation (and a failed close
+	// leaves it open), so idempotency must scan every status. An open-only
+	// list never sees the closed marker and re-sends every cycle (hq-h2h).
 	listCmd := exec.Command("bd", "list",
 		"--type=event",
+		"--all",
 		"--json",
-		"--limit=20",
+		"--limit=100",
 	)
 	listOutput, err := listCmd.Output()
 	if err != nil {
