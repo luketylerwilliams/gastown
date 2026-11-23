@@ -293,6 +293,13 @@ func (m *Manager) start(foreground bool, agentOverride string, allowForkRig bool
 	theme := tmux.ResolveSessionTheme(townRoot, m.rig.Name, "refinery", "")
 	_ = t.ConfigureGasTownSession(sessionID, theme, m.rig.Name, "refinery", "refinery")
 
+	// Log a crash event when the pane dies (gt log crash). Refinery panes are
+	// the top source of handoff-pane-death zombies (hq-hpd1); without this
+	// hook a dead refinery pane left zero trace in town.log.
+	if err := t.SetPaneDiedHook(sessionID, "refinery/"+m.rig.Name); err != nil {
+		log.Printf("warning: could not set pane-died hook for %s: %v", sessionID, err)
+	}
+
 	// Accept startup dialogs (workspace trust + bypass permissions) if they appear.
 	// Must be before WaitForRuntimeReady to avoid race where dialog blocks prompt detection.
 	_ = t.AcceptStartupDialogs(sessionID)

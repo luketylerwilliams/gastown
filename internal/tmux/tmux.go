@@ -2271,7 +2271,7 @@ func (t *Tmux) FindAgentPane(session string) (string, error) {
 // the pane ID of the one running the agent. This is the legacy path for sessions
 // that predate GT_PANE_ID (gt-qmsx).
 func (t *Tmux) findAgentPaneByScan(session string) (string, error) {
-	out, err := t.run("list-panes", "-s", "-t", session, "-F", "#{pane_id}\t#{pane_current_command}\t#{pane_pid}")
+	out, err := t.run("list-panes", "-s", "-t", session, "-F", "#{pane_id}\t#{pane_current_command}\t#{pane_pid}\t#{pane_dead}")
 	if err != nil {
 		return "", err
 	}
@@ -2287,13 +2287,19 @@ func (t *Tmux) findAgentPaneByScan(session string) (string, error) {
 
 	// Check each pane for agent process
 	for _, line := range lines {
-		parts := strings.SplitN(line, "\t", 3)
-		if len(parts) < 3 {
+		parts := strings.SplitN(line, "\t", 4)
+		if len(parts) < 4 {
 			continue
 		}
 		paneID := parts[0]
 		paneCmd := parts[1]
 		panePID := parts[2]
+
+		// Dead panes retain a stale pane_current_command; never select them
+		// as the agent pane (hq-hpd1).
+		if parts[3] == "1" {
+			continue
+		}
 
 		if t.matchesPaneRuntime(session, paneCmd, panePID, processNames) {
 			return paneID, nil
@@ -2407,9 +2413,43 @@ func (z ZombieStatus) IsZombie() bool {
 	return z == AgentDead || z == AgentHung
 }
 
+// paneDead reports whether the given pane target (a pane ID like "%5", or a
+// session/pane specifier like "mysession:^") has a dead process.
+//
+// A dead pane RETAINS its stale #{pane_current_command} (the dead agent's
+// name), so any liveness check that matches on the command string MUST
+// consult pane_dead first — otherwise a zombie session (tmux alive, pane
+// dead) is reported as running. (hq-hpd1: handoff left a dead pane whose
+// stale command fooled every liveness check for ~12 minutes.)
+func (t *Tmux) paneDead(pane string) (bool, error) {
+	out, err := t.run("display-message", "-t", pane, "-p", "#{pane_dead}")
+	if err != nil {
+		return false, err
+	}
+	return strings.TrimSpace(out) == "1", nil
+}
+
+// targetPaneDead reports whether the session's agent pane is dead, using the
+// same pane targeting as the liveness checks: the declared GT_PANE_ID when it
+// still resolves inside this session, otherwise the first window's pane
+// (session:^, matching GetPaneCommand).
+func (t *Tmux) targetPaneDead(session string) (bool, error) {
+	target := session + ":^"
+	if declared, err := t.GetEnvironment(session, "GT_PANE_ID"); err == nil && declared != "" {
+		// Pane IDs are tmux-global; verify the declared pane still belongs to
+		// this session (a stale GT_PANE_ID may resolve in a restarted session).
+		if paneSession, err := t.run("display-message", "-t", declared, "-p", "#{session_name}"); err == nil && strings.TrimSpace(paneSession) == session {
+			target = declared
+		}
+	}
+	return t.paneDead(target)
+}
+
 // CheckSessionHealth determines the health status of an agent session.
-// It performs three levels of checking:
+// It performs four levels of checking:
 //  1. Session existence (tmux has-session)
+//  1.5. Agent pane liveness (targetPaneDead — a dead pane retains a stale
+//      pane_current_command that would fool the command-based checks below)
 //  2. Agent process liveness (IsAgentAlive — checks process tree)
 //  3. Activity staleness (GetSessionActivity — checks tmux output timestamp)
 //
@@ -2423,6 +2463,15 @@ func (t *Tmux) CheckSessionHealth(session string, maxInactivity time.Duration) Z
 	alive, err := t.HasSession(session)
 	if err != nil || !alive {
 		return SessionDead
+	}
+
+	// Level 1.5: Is the agent pane dead? A dead pane retains a stale
+	// pane_current_command (the dead agent's name), which Level 2's command
+	// match would trust as "alive" (hq-hpd1). Dead pane = agent dead,
+	// regardless of what the command string says. On query error, fall
+	// through to Level 2 — a transient tmux hiccup must not report death.
+	if dead, err := t.targetPaneDead(session); err == nil && dead {
+		return AgentDead
 	}
 
 	// Level 2: Is the agent process running inside the session?
@@ -2840,6 +2889,10 @@ Run: gt mail inbox
 // If expectedPaneCommands is non-empty, the pane's current command must match one of them.
 // If expectedPaneCommands is empty, any non-shell command counts as "agent running".
 func (t *Tmux) IsAgentRunning(session string, expectedPaneCommands ...string) bool {
+	// A dead pane retains a stale pane_current_command (hq-hpd1).
+	if dead, _ := t.paneDead(session + ":^"); dead {
+		return false
+	}
 	cmd, err := t.GetPaneCommand(session)
 	if err != nil {
 		return false
@@ -2908,16 +2961,20 @@ func (t *Tmux) IsRuntimeRunningChecked(session string, processNames []string) (b
 	if running {
 		return true, nil
 	}
-	out, err := t.run("list-panes", "-s", "-t", session, "-F", "#{pane_current_command}\t#{pane_pid}")
+	out, err := t.run("list-panes", "-s", "-t", session, "-F", "#{pane_current_command}\t#{pane_pid}\t#{pane_dead}")
 	if err != nil {
 		return false, err
 	}
 	for _, line := range strings.Split(strings.TrimSpace(out), "\n") {
-		parts := strings.SplitN(line, "\t", 2)
-		if len(parts) < 2 {
+		parts := strings.SplitN(line, "\t", 3)
+		if len(parts) < 3 {
 			continue
 		}
 		cmd, pid := parts[0], parts[1]
+		// Dead panes retain a stale pane_current_command; never match them (hq-hpd1).
+		if parts[2] == "1" {
+			continue
+		}
 		running, err := t.matchesPaneRuntimeChecked(session, cmd, pid, processNames)
 		if err != nil {
 			return false, err
@@ -2937,6 +2994,11 @@ func (t *Tmux) checkTargetPaneForRuntime(session, paneID string, processNames []
 }
 
 func (t *Tmux) checkTargetPaneForRuntimeChecked(session, paneID string, processNames []string) (bool, error) {
+	// A dead pane retains a stale pane_current_command; never trust command
+	// matching for a dead pane (hq-hpd1).
+	if dead, err := t.paneDead(paneID); err == nil && dead {
+		return false, nil
+	}
 	cmd, err := t.run("display-message", "-t", paneID, "-p", "#{pane_current_command}")
 	if err != nil {
 		return false, err
@@ -2960,6 +3022,11 @@ func (t *Tmux) checkPaneForRuntime(session string, processNames []string) bool {
 }
 
 func (t *Tmux) checkPaneForRuntimeChecked(session string, processNames []string) (bool, error) {
+	// A dead pane retains a stale pane_current_command; never trust command
+	// matching for a dead pane (hq-hpd1).
+	if dead, err := t.paneDead(session + ":^"); err == nil && dead {
+		return false, nil
+	}
 	cmd, err := t.GetPaneCommand(session)
 	if err != nil {
 		return false, err

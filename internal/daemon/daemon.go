@@ -111,6 +111,14 @@ type Daemon struct {
 	// Only accessed from heartbeat loop goroutine - no sync needed.
 	lastMaintenanceRun time.Time
 
+	// zombieFirstSeen tracks when a session was first observed with a dead
+	// agent pane but a surviving tmux session (handoff-pane-death zombie,
+	// hq-hpd1). A short grace window separates a healthy handoff (pane dead
+	// for the sub-second window between old-process death and successor
+	// spawn) from a failed handoff (pane dead indefinitely).
+	// Only accessed from heartbeat loop goroutine - no sync needed.
+	zombieFirstSeen map[string]time.Time
+
 	// mayorZombieCount tracks consecutive patrol cycles where the Mayor tmux
 	// session exists but the agent process is not detected. A count >= 3
 	// triggers a zombie restart, debouncing transient gaps during handoffs.
@@ -886,6 +894,10 @@ func (d *Daemon) heartbeat(state *State) {
 
 	// 0b. Kill ghost sessions left over from stale registry (default "gt" prefix).
 	d.killDefaultPrefixGhosts()
+
+	// 0c. Reap zombie sessions (tmux alive, agent pane dead) so a failed
+	// handoff cannot leave a session that lies about its own liveness (hq-hpd1).
+	d.sweepZombieSessions()
 
 	// 0. Ensure Dolt server is running (if configured)
 	// This must happen before beads operations that depend on Dolt.
@@ -2028,6 +2040,66 @@ func (d *Daemon) killRefinerySessions() {
 		}
 		return nil
 	})
+}
+
+// zombieGrace is how long a dead agent pane must persist before the daemon
+// reaps the session. A healthy handoff (gt handoff -> respawn-pane -k) shows
+// a dead pane only for the sub-second window between the old process's death
+// and the successor's spawn; a FAILED handoff leaves the pane dead
+// indefinitely (hq-hpd1). 2 minutes is far above any healthy window and far
+// below the 12-minute blind spot of the C23 episode. (var, not const: tests
+// shorten it.)
+var zombieGrace = 2 * time.Minute
+
+// sweepZombieSessions reaps "zombie" sessions: tmux session alive but agent
+// pane dead (CheckSessionHealth == AgentDead). This is the handoff-pane-death
+// failure mode (hq-hpd1): a handoff sets remain-on-exit, respawns the
+// successor, and if the successor never comes up the session survives holding
+// a dead pane whose STALE pane_current_command fools command-based liveness
+// checks — witnesses, daemons, and 'gt session status' all report "running".
+//
+// Reaping converts the zombie into a clean, logged session death: the
+// ensure* steps of this and later heartbeats restart roles that should be
+// running (witnesses, deacon, mayor, refineries with pending events), and
+// idle rigs are left cleanly stopped instead of holding a lying session.
+func (d *Daemon) sweepZombieSessions() {
+	if d.zombieFirstSeen == nil {
+		d.zombieFirstSeen = make(map[string]time.Time)
+	}
+
+	targets := make([]string, 0, 8)
+	for _, ts := range session.TownSessions() {
+		targets = append(targets, ts.SessionID)
+	}
+	for _, rigName := range d.getKnownRigs() {
+		prefix := session.PrefixFor(rigName)
+		targets = append(targets, session.WitnessSessionName(prefix), session.RefinerySessionName(prefix))
+	}
+
+	now := time.Now()
+	for _, name := range targets {
+		switch d.tmux.CheckSessionHealth(name, 0) {
+		case tmux.AgentDead:
+			first, seen := d.zombieFirstSeen[name]
+			if !seen {
+				d.zombieFirstSeen[name] = now
+				d.logger.Printf("Zombie session observed (dead pane, session alive): %s — reaping if still dead after %v", name, zombieGrace)
+			} else if now.Sub(first) >= zombieGrace {
+				delete(d.zombieFirstSeen, name)
+				d.logger.Printf("Reaping zombie session %s (dead pane persisted %v, hq-hpd1)", name, now.Sub(first))
+				_ = events.LogFeed(events.TypeSessionDeath, name,
+					events.SessionDeathPayload(name, name, "zombie: dead agent pane (handoff-pane-death, hq-hpd1)", "daemon zombie sweep"))
+				if err := d.tmux.KillSessionWithProcesses(name); err != nil {
+					d.logger.Printf("Error killing zombie session %s: %v", name, err)
+				} else {
+					d.recordSessionDeath(name)
+				}
+			}
+		default:
+			// Healthy or absent — drop any pending observation.
+			delete(d.zombieFirstSeen, name)
+		}
+	}
 }
 
 // killDefaultPrefixGhosts kills tmux sessions that use the default "gt" prefix

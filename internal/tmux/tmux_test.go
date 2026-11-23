@@ -2852,6 +2852,79 @@ func TestCheckSessionHealth_ActivityCheck(t *testing.T) {
 	// without needing a real Claude process.
 }
 
+// TestCheckSessionHealth_DeadPaneZombie reproduces the handoff-pane-death
+// incident (hq-hpd1, fdoc-refinery C23 2026-11-23 04:47Z): a session created
+// WITH A COMMAND (agent = pane foreground) whose process dies while
+// remain-on-exit is on. The pane goes dead but the session survives, and tmux
+// RETAINS the stale pane_current_command (the dead agent's name). Command
+// matching alone would report the session "healthy" — the liveness chain must
+// consult pane_dead instead.
+func TestCheckSessionHealth_DeadPaneZombie(t *testing.T) {
+	if !hasTmux() {
+		t.Skip("tmux not installed")
+	}
+	tm := newTestTmux(t)
+	sessionName := fmt.Sprintf("gt-test-deadpane-%d", os.Getpid())
+
+	// "sleep" stands in for the agent binary; GT_PROCESS_NAMES makes the
+	// liveness chain match on the pane command, exactly like a real agent
+	// session matches on claude/opencode/etc.
+	env := map[string]string{"GT_PROCESS_NAMES": "sleep"}
+	if err := tm.NewSessionWithCommandAndEnv(sessionName, "", "sleep 60", env); err != nil {
+		t.Fatalf("NewSessionWithCommandAndEnv: %v", err)
+	}
+	defer tm.KillSession(sessionName)
+	time.Sleep(300 * time.Millisecond)
+
+	// Sanity: while the process is alive the session reports healthy.
+	if status := tm.CheckSessionHealth(sessionName, 0); status != SessionHealthy {
+		t.Fatalf("CheckSessionHealth(alive) = %v, want SessionHealthy", status)
+	}
+
+	// Simulate the handoff state: remain-on-exit on, then the agent process
+	// dies (e.g. the handoff's respawned successor never came up).
+	if err := tm.SetRemainOnExit(sessionName, true); err != nil {
+		t.Fatalf("SetRemainOnExit: %v", err)
+	}
+	pid, err := tm.GetPanePID(sessionName)
+	if err != nil {
+		t.Fatalf("GetPanePID: %v", err)
+	}
+	if err := exec.Command("kill", pid).Run(); err != nil {
+		t.Fatalf("kill %s: %v", pid, err)
+	}
+
+	// Wait for the pane to be marked dead.
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		dead, err := tm.paneDead(sessionName + ":^")
+		if err == nil && dead {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("pane never became dead within 5s")
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+
+	// The session still exists (remain-on-exit) but the agent pane is dead.
+	if exists, _ := tm.HasSession(sessionName); !exists {
+		t.Fatalf("session disappeared; test requires the zombie session to survive")
+	}
+	// And tmux retains the stale command — this is what fools the old code.
+	if cmd, err := tm.GetPaneCommand(sessionName); err != nil || cmd != "sleep" {
+		t.Fatalf("expected stale pane_current_command \"sleep\", got %q (err=%v)", cmd, err)
+	}
+
+	// THE INCIDENT ASSERTION: a dead pane must report AgentDead, not healthy.
+	if status := tm.CheckSessionHealth(sessionName, 0); status != AgentDead {
+		t.Errorf("CheckSessionHealth(dead pane) = %v, want AgentDead (stale pane_current_command=%q fooled the check)", status, "sleep")
+	}
+	if tm.IsAgentAlive(sessionName) {
+		t.Errorf("IsAgentAlive(dead pane) = true, want false")
+	}
+}
+
 func TestValidateCommandBinary(t *testing.T) {
 	t.Parallel()
 
