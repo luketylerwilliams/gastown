@@ -69,12 +69,17 @@ func TestCheckDeaconHeartbeat_IdleGuard(t *testing.T) {
 	}
 
 	tests := []struct {
-		name             string
-		heartbeatAge     time.Duration
-		stores           map[string]beadsdk.Storage
-		wantNudgeLog     bool
-		wantIdleGuardLog bool
-		desc             string
+		name string
+		// operationalConfig, when set, is written to
+		// <townRoot>/settings/config.json before the check runs. Used to
+		// prove the kill path reads configured thresholds (hq-asfp — the
+		// operational.deacon knobs were previously dead code).
+		operationalConfig string
+		heartbeatAge      time.Duration
+		stores            map[string]beadsdk.Storage
+		wantNudgeLog      bool
+		wantIdleGuardLog  bool
+		desc              string
 	}{
 		{
 			name:         "idle: stale heartbeat, no work — nudge suppressed",
@@ -121,14 +126,28 @@ func TestCheckDeaconHeartbeat_IdleGuard(t *testing.T) {
 			desc:             "Nudge must fire conservatively when work state is unknown",
 		},
 		{
-			name:         "very stale: heartbeat >= 20 min — escalation path, no nudge",
-			heartbeatAge: 21 * time.Minute,
+			name: "very stale via config: configured 20m threshold, 21m heartbeat — escalation path, no nudge",
+			// hq-asfp: the kill path must honor operational.deacon.
+			// heartbeat_very_stale_threshold; pre-fix this knob was dead and
+			// only the compiled constant applied.
+			operationalConfig: `{"operational":{"deacon":{"heartbeat_very_stale_threshold":"20m"}}}`,
+			heartbeatAge:      21 * time.Minute,
 			stores: map[string]beadsdk.Storage{
 				"hq": &searchStorage{results: map[string][]*beadsdk.Issue{}},
 			},
 			wantNudgeLog:     false,
 			wantIdleGuardLog: false,
-			desc:             "Very stale heartbeat takes escalation path, not nudge path; idle guard not reached",
+			desc:             "Configured very-stale threshold must drive the escalation path; idle guard not reached",
+		},
+		{
+			name:         "very stale at raised default: 31m heartbeat vs 30m default — escalation path, no nudge",
+			heartbeatAge: 31 * time.Minute,
+			stores: map[string]beadsdk.Storage{
+				"hq": &searchStorage{results: map[string][]*beadsdk.Issue{}},
+			},
+			wantNudgeLog:     false,
+			wantIdleGuardLog: false,
+			desc:             "Raised 30m default (hq-asfp, slow-model headroom over 15m backoff-max) must take the escalation path",
 		},
 	}
 
@@ -146,6 +165,16 @@ func TestCheckDeaconHeartbeat_IdleGuard(t *testing.T) {
 			t.Setenv("TMUX_LOG", tmuxLog)
 
 			writeDeaconHeartbeat(t, townRoot, tc.heartbeatAge)
+
+			if tc.operationalConfig != "" {
+				if err := os.MkdirAll(filepath.Join(townRoot, "settings"), 0o755); err != nil {
+					t.Fatalf("mkdir settings: %v", err)
+				}
+				if err := os.WriteFile(filepath.Join(townRoot, "settings", "config.json"),
+					[]byte(tc.operationalConfig), 0o644); err != nil {
+					t.Fatalf("write config.json: %v", err)
+				}
+			}
 
 			d := newTestDaemonWithStores(t, townRoot, tc.stores)
 
