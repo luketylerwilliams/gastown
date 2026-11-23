@@ -1859,6 +1859,36 @@ func (d *Daemon) hasPendingEvents(channel string) bool {
 	return false
 }
 
+// hasQueuedMergeRequests reports whether the rig's merge queue holds any open
+// merge-request beads. hq-kt0q: the events dropbox is only one wake source for
+// refineries, but the merge queue is the refinery's actual work source — an MR
+// that enters the queue (gt mq submit / gt done) must also trigger a spawn,
+// otherwise ready MRs sit unprocessed for as long as no refinery session
+// happens to be alive. Query mirrors gt mq list (internal/cmd/mq_list.go):
+// MRs are ephemeral wisp-plane beads labelled gt:merge-request, so use
+// ListMergeRequests (issues + wisps) with no priority filter.
+// Returns false on query error (dolt down): the events gate still applies,
+// matching pre-existing behaviour.
+func (d *Daemon) hasQueuedMergeRequests(rigName string) bool {
+	r := &rig.Rig{
+		Name: rigName,
+		Path: filepath.Join(d.config.TownRoot, rigName),
+	}
+	b := beads.New(r.BeadsPath())
+	opts := beads.ListOptions{
+		Label:    "gt:merge-request",
+		Priority: -1,
+		Rig:      rigName,
+		Status:   "open",
+	}
+	mrs, err := b.ListMergeRequests(opts)
+	if err != nil {
+		d.logger.Printf("MR queue check failed for %s (refinery gate): %v", rigName, err)
+		return false
+	}
+	return len(mrs) > 0
+}
+
 // ensureWitnessRunning ensures the witness for a specific rig is running.
 // Discover, don't track: uses Manager.Start() which checks tmux directly (gt-zecmc).
 func (d *Daemon) ensureWitnessRunning(rigName string) {
@@ -1956,7 +1986,10 @@ func (d *Daemon) ensureRefineryRunning(rigName string) {
 	// If a refinery session is already running, Start() returns ErrAlreadyRunning (cheap).
 	// But spawning a NEW session with an empty queue burns API credits for nothing.
 	// The refinery formula uses await-event internally, so it will wake when events appear.
-	if !d.hasPendingEvents("refinery") {
+	// hq-kt0q: the events dropbox is not the only work source — a queued merge request
+	// (gt mq submit / gt done) must also pass the gate, or ready MRs stall until a
+	// refinery session happens to be alive.
+	if !d.hasPendingEvents("refinery") && !d.hasQueuedMergeRequests(rigName) {
 		// Check if session already exists before skipping — let running sessions continue
 		r := &rig.Rig{
 			Name: rigName,
@@ -1964,7 +1997,7 @@ func (d *Daemon) ensureRefineryRunning(rigName string) {
 		}
 		mgr := refinery.NewManager(r)
 		if running, _ := mgr.IsRunning(); !running {
-			d.logger.Printf("No pending refinery events and no session running for %s, skipping spawn", rigName)
+			d.logger.Printf("No pending refinery events, no queued MRs, and no session running for %s, skipping spawn", rigName)
 			return
 		}
 	}
