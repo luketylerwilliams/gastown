@@ -1906,10 +1906,14 @@ func (d *Daemon) ensureMayorRunning() {
 			// During handoffs the agent is briefly undetectable, so we
 			// only restart if the session has been a zombie for multiple
 			// consecutive patrol cycles (debounce).
-			if !d.isMayorAgentAlive(mgr) {
+			alive, note := d.isMayorAgentAlive(mgr)
+			if !alive {
 				d.mayorZombieCount++
 				if d.mayorZombieCount >= 3 {
 					d.logger.Printf("Mayor zombie detected (%d cycles), restarting", d.mayorZombieCount)
+					if note != "" {
+						d.logger.Printf("Mayor liveness evidence: %s", note)
+					}
 					if stopErr := mgr.Stop(); stopErr != nil && stopErr != mayor.ErrNotRunning {
 						d.logger.Printf("Error stopping zombie Mayor: %v", stopErr)
 						return
@@ -1920,11 +1924,24 @@ func (d *Daemon) ensureMayorRunning() {
 						return
 					}
 					d.logger.Println("Mayor restarted after zombie cleanup")
+				} else if note != "" {
+					// Pane mixup (hq-p4po): a foreign agent holds the mayor
+					// pane. Log the identity evidence so the incident is
+					// diagnosable from daemon.log alone.
+					d.logger.Printf("Mayor pane holds foreign agent (cycle %d/3): %s", d.mayorZombieCount, note)
 				} else {
 					d.logger.Printf("Mayor agent not detected (cycle %d/3), waiting before restart", d.mayorZombieCount)
 				}
 			} else {
 				d.mayorZombieCount = 0
+				if note != "" {
+					// Reset transitions are logged too (hq-p4po): silent
+					// 'alive' is what made the 2026-11-23 mixup
+					// undiagnosable for 13m.
+					d.logger.Printf("Mayor alive (zombie count reset): %s", note)
+				} else {
+					d.logger.Printf("Mayor alive (zombie count reset)")
+				}
 			}
 			return
 		}
@@ -1936,10 +1953,34 @@ func (d *Daemon) ensureMayorRunning() {
 	d.logger.Println("Mayor started successfully")
 }
 
-// isMayorAgentAlive checks if the Mayor's agent process is running in tmux.
-func (d *Daemon) isMayorAgentAlive(mgr *mayor.Manager) bool {
+// isMayorAgentAlive checks if the Mayor's agent process is running in tmux,
+// with identity verification (hq-p4po). A name-matched process whose
+// GT_ROLE/BD_ACTOR do not match the mayor session (a pane mixup) counts as
+// NOT alive so the zombie path stops the mixed session and respawns a clean
+// mayor. The returned note carries human-readable evidence for logging;
+// it is empty when the check found nothing unusual.
+func (d *Daemon) isMayorAgentAlive(mgr *mayor.Manager) (bool, string) {
 	t := tmux.NewTmux()
-	return t.IsAgentAlive(mgr.SessionName())
+	info, err := t.IsAgentAliveIdentified(mgr.SessionName())
+	if err != nil {
+		// Fall back to the legacy name-based check on query error so a
+		// transient failure never loses detection entirely.
+		legacy := t.IsAgentAlive(mgr.SessionName())
+		if legacy {
+			return true, fmt.Sprintf("identified check errored (%v); name-based alive", err)
+		}
+		return false, ""
+	}
+	if info.Foreign {
+		return false, fmt.Sprintf(
+			"pane mixup: pid %s carries identity GT_ROLE=%q BD_ACTOR=%q but session %s declares GT_ROLE=%q BD_ACTOR=%q",
+			info.MatchedPID, info.MatchedRole, info.MatchedActor, mgr.SessionName(), info.ExpectedRole, info.ExpectedActor)
+	}
+	if info.IdentityChecked {
+		return info.Alive, fmt.Sprintf("identity verified: pid %s GT_ROLE=%q BD_ACTOR=%q",
+			info.MatchedPID, info.MatchedRole, info.MatchedActor)
+	}
+	return info.Alive, ""
 }
 
 // killDeaconSessions kills leftover deacon and boot tmux sessions.

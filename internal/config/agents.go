@@ -382,7 +382,12 @@ var builtinPresets = map[AgentPreset]*AgentPresetInfo{
 			"OPENCODE_PERMISSION":     `{"*":"allow"}`,
 			"OPENCODE_CONFIG_CONTENT": `{"lsp":true}`,
 		},
-		ProcessNames:        []string{"opencode", "node", "bun"}, // Runs as Node.js or Bun
+		// hq-p4po: generic 'node'/'bun' dropped — they let any stray JS
+		// runtime in the pane spoof liveness (pane-mixup class). The
+		// opencode binary reports comm "opencode" (native ELF); the
+		// gt-opencode wrapper execs it. Identity verification
+		// (internal/tmux identity.go) guards the rest.
+		ProcessNames:        []string{"opencode", "gt-opencode"},
 		SessionIDEnv:        "",                                  // OpenCode manages sessions internally
 		ResumeFlag:          "",                                  // No resume support yet
 		ResumeStyle:         "",

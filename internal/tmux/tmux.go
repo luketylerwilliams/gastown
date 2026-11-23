@@ -3169,6 +3169,237 @@ func (t *Tmux) resolveSessionProcessNamesChecked(session string) ([]string, erro
 	return config.GetProcessNames(agentName), nil // Returns Claude defaults if empty
 }
 
+// AgentAliveInfo is the result of an identity-verified liveness check.
+type AgentAliveInfo struct {
+	// Alive reports whether the session holds its agent.
+	Alive bool
+	// Foreign reports a pane mixup (hq-p4po): a process matching the
+	// session's agent names is present, but its GT_ROLE/BD_ACTOR identity
+	// does not match the identity the session declares. A foreign agent in
+	// the pane must be treated as NOT alive so the zombie path restarts
+	// the session cleanly.
+	Foreign bool
+	// MatchedPID is the process that matched by name ("" = no name match).
+	MatchedPID string
+	// MatchedRole / MatchedActor are the identity markers of MatchedPID.
+	MatchedRole  string
+	MatchedActor string
+	// ExpectedRole / ExpectedActor are the identity declared by the
+	// session's tmux environment.
+	ExpectedRole  string
+	ExpectedActor string
+	// IdentityChecked reports whether an identity comparison was performed.
+	// False means the decision fell back to the legacy name-based result
+	// (no identity markers on either side, or identity unreadable).
+	IdentityChecked bool
+}
+
+// IsAgentAliveIdentified checks session liveness with identity verification
+// (hq-p4po). It performs the same name-based pane matching as IsAgentAlive,
+// then verifies that the name-matched process carries the same GT_ROLE /
+// BD_ACTOR identity the session declares (identity.go). A name match by a
+// foreign process — the pane-mixup class that defeated mayor zombie
+// detection on 2026-11-23 — is reported as not-alive with Foreign=true.
+//
+// The identity match is scoped to this session's own pane process tree
+// (ZFC GT_PANE_ID when declared, otherwise the session's panes); it never
+// inspects processes outside the session, so unrelated processes that
+// merely inherited a role variable (daemons, servers) cannot interfere.
+func (t *Tmux) IsAgentAliveIdentified(session string) (AgentAliveInfo, error) {
+	info := AgentAliveInfo{}
+	processNames, err := t.resolveSessionProcessNamesChecked(session)
+	if err != nil {
+		return info, err
+	}
+	processNames, err = processNamesForSessionChecked(t, session, processNames)
+	if err != nil {
+		return info, err
+	}
+	expected, err := t.SessionIdentity(session)
+	if err != nil {
+		return info, err
+	}
+	info.ExpectedRole, info.ExpectedActor = expected.role, expected.actor
+	if len(processNames) == 0 {
+		return info, nil
+	}
+
+	for _, pane := range t.livenessPanes(session) {
+		matched, matchedPID, err := paneMatchesRuntimeID(pane.cmd, pane.pid, processNames)
+		if err != nil {
+			return info, err
+		}
+		if !matched {
+			continue
+		}
+		info.MatchedPID = matchedPID
+		actual, aerr := readProcessIdentity(matchedPID)
+		if aerr != nil {
+			// Identity unreadable (process exited mid-check): keep the
+			// legacy name-based result so a transient read failure cannot
+			// restart a healthy session.
+			info.Alive = true
+			return info, nil
+		}
+		info.MatchedRole, info.MatchedActor = actual.role, actual.actor
+		if !expected.known || !actual.known {
+			// Legacy: one side carries no identity markers — the name
+			// match stands (unchanged behavior for pre-identity sessions).
+			info.Alive = true
+			return info, nil
+		}
+		info.IdentityChecked = true
+		info.Alive = identityMatches(expected, actual)
+		if !info.Alive {
+			info.Foreign = true
+		}
+		return info, nil
+	}
+	return info, nil
+}
+
+// livenessPane is a pane (command + pid) to probe for the session's agent.
+type livenessPane struct {
+	cmd string
+	pid string
+}
+
+// livenessPanes resolves the panes a liveness check must probe: the declared
+// ZFC pane (GT_PANE_ID, gt-qmsx) when present, otherwise every pane of the
+// session (legacy fallback, mirroring IsRuntimeRunningChecked).
+func (t *Tmux) livenessPanes(session string) []livenessPane {
+	if declared, ok, err := t.getEnvironmentOptional(session, "GT_PANE_ID"); err == nil && ok && declared != "" && runtime.GOOS != "windows" {
+		cmd, err := t.run("display-message", "-t", declared, "-p", "#{pane_current_command}")
+		if err != nil {
+			return nil
+		}
+		pid, err := t.run("display-message", "-t", declared, "-p", "#{pane_pid}")
+		if err != nil {
+			return nil
+		}
+		return []livenessPane{{cmd: strings.TrimSpace(cmd), pid: strings.TrimSpace(pid)}}
+	}
+	out, err := t.run("list-panes", "-s", "-t", session, "-F", "#{pane_current_command}\t#{pane_pid}")
+	if err != nil {
+		return nil
+	}
+	var panes []livenessPane
+	for _, line := range strings.Split(strings.TrimSpace(out), "\n") {
+		parts := strings.SplitN(line, "\t", 2)
+		if len(parts) < 2 {
+			continue
+		}
+		panes = append(panes, livenessPane{cmd: parts[0], pid: parts[1]})
+	}
+	return panes
+}
+
+// paneMatchesRuntimeID mirrors matchesPaneRuntimeChecked but also reports the
+// PID of the process that matched by name, so identity verification can read
+// that process's environment.
+func paneMatchesRuntimeID(cmd, pid string, processNames []string) (matched bool, matchedPID string, err error) {
+	if len(processNames) == 0 {
+		return false, "", nil
+	}
+	// Direct command match
+	for _, name := range processNames {
+		if cmd == name {
+			return true, pid, nil
+		}
+	}
+	if pid == "" {
+		return false, "", nil
+	}
+	// If pane command is a shell, the agent is a descendant of the shell
+	for _, shell := range constants.SupportedShells {
+		if cmd == shell {
+			dpid, err := findDescendantWithNames(pid, processNames, 0)
+			if err != nil {
+				return false, "", err
+			}
+			return dpid != "", dpid, nil
+		}
+	}
+	// Unrecognized command: check if the process itself matches (version-as-argv[0])
+	selfMatch, err := processMatchesNamesChecked(pid, processNames)
+	if err == nil && selfMatch {
+		return true, pid, nil
+	}
+	// Finally check descendants as fallback
+	dpid, derr := findDescendantWithNames(pid, processNames, 0)
+	if derr != nil {
+		return false, "", derr
+	}
+	if dpid != "" {
+		return true, dpid, nil
+	}
+	if err != nil {
+		return false, "", err
+	}
+	return false, "", nil
+}
+
+// findDescendantWithNames is hasDescendantWithNames that also reports the PID
+// of the first matching descendant ("" when none).
+func findDescendantWithNames(pid string, names []string, depth int) (string, error) {
+	if len(names) == 0 || depth > 10 {
+		return "", nil
+	}
+	if runtime.GOOS == "windows" {
+		return "", nil // identity checking is Linux-only; legacy name checks handle Windows
+	}
+	root, ok := normalizeProcessID(pid)
+	if !ok {
+		return "", fmt.Errorf("invalid process ID %q", pid)
+	}
+	out, err := exec.Command("ps", "-axo", "pid=,ppid=,comm=").Output()
+	if err != nil {
+		return "", err
+	}
+	return findDescendantWithNamesFromSnapshot(root, names, depth, parseProcessSnapshot(out))
+}
+
+// findDescendantWithNamesFromSnapshot walks one ps snapshot like
+// hasDescendantWithNamesFromSnapshot, returning the first matching
+// descendant PID instead of a boolean.
+func findDescendantWithNamesFromSnapshot(root string, names []string, depth int, snapshot processSnapshot) (string, error) {
+	const maxDepth = 10
+	if len(names) == 0 || depth > maxDepth {
+		return "", nil
+	}
+	nameSet := make(map[string]bool, len(names))
+	for _, n := range names {
+		n = strings.TrimSpace(n)
+		if n != "" {
+			nameSet[n] = true
+		}
+	}
+	if len(nameSet) == 0 {
+		return "", nil
+	}
+	seen := map[string]bool{root: true}
+	var walk func(string, int) string
+	walk = func(pid string, currentDepth int) string {
+		if currentDepth > maxDepth {
+			return ""
+		}
+		for _, child := range snapshot.children[pid] {
+			if seen[child] {
+				continue
+			}
+			seen[child] = true
+			if nameSet[filepath.Base(strings.TrimSpace(snapshot.names[child]))] {
+				return child
+			}
+			if found := walk(child, currentDepth+1); found != "" {
+				return found
+			}
+		}
+		return ""
+	}
+	return walk(root, depth), nil
+}
+
 // WaitForCommand polls until the pane is NOT running one of the excluded commands.
 // Useful for waiting until a shell has started a new process (e.g., claude).
 // Returns nil when a non-excluded command is detected, or error on timeout.

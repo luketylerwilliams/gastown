@@ -292,13 +292,13 @@ func TestResolveProcessNames(t *testing.T) {
 			name:      "built-in preset with matching command (opencode)",
 			agentName: "opencode",
 			command:   "opencode",
-			want:      []string{"opencode", "node", "bun"},
+			want:      []string{"opencode", "gt-opencode"},
 		},
 		{
 			name:      "custom agent shadowing built-in with different command",
 			agentName: "codex",
 			command:   "opencode",
-			want:      []string{"opencode", "node", "bun"},
+			want:      []string{"opencode", "gt-opencode"},
 		},
 		{
 			name:      "custom agent shadowing built-in with same command",
@@ -328,7 +328,7 @@ func TestResolveProcessNames(t *testing.T) {
 			name:      "empty agent name with command",
 			agentName: "",
 			command:   "opencode",
-			want:      []string{"opencode", "node", "bun"},
+			want:      []string{"opencode", "gt-opencode"},
 		},
 		{
 			name:      "path-resolved command matches built-in preset",
@@ -340,7 +340,7 @@ func TestResolveProcessNames(t *testing.T) {
 			name:      "path-resolved command with unknown agent",
 			agentName: "my-custom-agent",
 			command:   "/opt/bin/opencode",
-			want:      []string{"opencode", "node", "bun"},
+			want:      []string{"opencode", "gt-opencode"},
 		},
 		{
 			name:      "path-resolved unknown command falls back to basename",
@@ -467,7 +467,7 @@ func TestResolveProcessNames(t *testing.T) {
 				Args:    []string{"opencode", "--quiet"},
 			},
 			command: "nohup",
-			want:    []string{"opencode", "node", "bun"},
+			want:    []string{"opencode", "gt-opencode"},
 		},
 		{
 			name: "sudo -u runner codex unwraps to codex preset",
@@ -742,7 +742,7 @@ func TestGetProcessNames(t *testing.T) {
 		{"cursor", []string{"cursor-agent", "agent"}},
 		{"auggie", []string{"auggie"}},
 		{"amp", []string{"amp"}},
-		{"opencode", []string{"opencode", "node", "bun"}},
+		{"opencode", []string{"opencode", "gt-opencode"}},
 		{"copilot", []string{"copilot"}},
 		{"pi", []string{"pi", "node", "bun"}},
 		{"unknown", []string{"node", "claude"}}, // Falls back to Claude's process
@@ -1124,11 +1124,12 @@ func TestOpenCodeAgentPreset(t *testing.T) {
 		t.Errorf("OPENCODE_PERMISSION = %q, want {\"*\":\"allow\"}", permission)
 	}
 
-	// Check ProcessNames for detection (opencode, node, bun)
-	if len(info.ProcessNames) != 3 {
-		t.Errorf("opencode ProcessNames length = %d, want 3", len(info.ProcessNames))
+	// Check ProcessNames for detection (opencode, gt-opencode; hq-p4po
+	// dropped generic node/bun so stray runtimes cannot spoof liveness)
+	if len(info.ProcessNames) != 2 {
+		t.Errorf("opencode ProcessNames length = %d, want 2", len(info.ProcessNames))
 	}
-	expectedNames := []string{"opencode", "node", "bun"}
+	expectedNames := []string{"opencode", "gt-opencode"}
 	for i, want := range expectedNames {
 		if i < len(info.ProcessNames) && info.ProcessNames[i] != want {
 			t.Errorf("opencode ProcessNames[%d] = %q, want %q", i, info.ProcessNames[i], want)
@@ -1166,13 +1167,14 @@ func TestOpenCodeProviderDefaults(t *testing.T) {
 		t.Errorf("defaultReadyDelayMs(opencode) = %d, want 8000", delay)
 	}
 
-	// Test defaultProcessNames for opencode (from preset: opencode, node, bun)
+	// Test defaultProcessNames for opencode (from preset: opencode, gt-opencode;
+	// hq-p4po dropped generic node/bun so stray runtimes cannot spoof liveness)
 	names := defaultProcessNames("opencode", "opencode")
-	if len(names) != 3 {
-		t.Errorf("defaultProcessNames(opencode) length = %d, want 3", len(names))
+	if len(names) != 2 {
+		t.Errorf("defaultProcessNames(opencode) length = %d, want 2", len(names))
 	}
-	if len(names) >= 3 && (names[0] != "opencode" || names[1] != "node" || names[2] != "bun") {
-		t.Errorf("defaultProcessNames(opencode) = %v, want [opencode, node, bun]", names)
+	if len(names) >= 2 && (names[0] != "opencode" || names[1] != "gt-opencode") {
+		t.Errorf("defaultProcessNames(opencode) = %v, want [opencode, gt-opencode]", names)
 	}
 
 	// Test defaultInstructionsFile for opencode
