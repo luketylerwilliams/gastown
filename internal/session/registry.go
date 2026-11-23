@@ -2,16 +2,19 @@
 package session
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"sort"
 	"strings"
 	"sync"
+	"time"
 
 	"regexp"
 
@@ -132,6 +135,18 @@ func InitRegistry(townRoot string) error {
 	}
 	tmux.SetDefaultSocket(socket)
 
+	// Reconcile TMUX_TMPDIR with the directory the town's tmux server actually
+	// lives in. The socket NAME alone does not identify a server: tmux keys the
+	// socket on $TMUX_TMPDIR/tmux-$UID/<name>, so a town started with
+	// TMUX_TMPDIR set (gastown.service sets ~/.tmux-tmp) is invisible to any gt
+	// invocation that lacks the variable — it reaches an empty server with the
+	// same name, sees zero sessions, and silently no-ops stop/restart while
+	// reporting success (hq-8drm). Persist the tmpdir on first observation and
+	// adopt it afterwards so every entry point converges on one server.
+	if err := reconcileTmuxTmpdir(townRoot, socket); err != nil {
+		errs = append(errs, fmt.Errorf("tmux tmpdir: %w", err))
+	}
+
 	r, err := BuildPrefixRegistryFromTown(townRoot)
 	if err != nil {
 		errs = append(errs, fmt.Errorf("prefix registry: %w", err))
@@ -146,6 +161,84 @@ func InitRegistry(townRoot string) error {
 	}
 
 	return errors.Join(errs...)
+}
+
+// tmuxTmpdirFile records the TMUX_TMPDIR the town's tmux server was started
+// with, relative to the town root. It is advisory state, not a lock.
+const tmuxTmpdirFile = ".runtime/tmux-tmpdir"
+
+// socketLiveIn reports whether a tmux server is actually *serving* the socket
+// named socket under the directory implied by tmpdir ("" meaning tmux's /tmp
+// default).
+//
+// Testing for the socket FILE is not sufficient: tmux leaves the socket inode
+// behind when a server exits, so a dead town leaves ~/tmp/tmux-$UID/<name>
+// present. Both the stale default-dir socket and the live TMUX_TMPDIR socket
+// can therefore exist at once, and a file-existence check would prefer the
+// dead one. `tmux -S <path> list-sessions` is the cheap authoritative probe:
+// it exits non-zero with "no server running on ..." for a stale socket.
+func socketLiveIn(tmpdir, socket string) bool {
+	base := tmpdir
+	if base == "" {
+		base = "/tmp"
+	}
+	path := filepath.Join(base, fmt.Sprintf("tmux-%d", os.Getuid()), socket)
+	if st, err := os.Stat(path); err != nil || st.Mode()&os.ModeSocket == 0 {
+		return false
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	// -u for UTF-8 parity with the rest of the tmux plumbing.
+	return exec.CommandContext(ctx, "tmux", "-u", "-S", path, "list-sessions").Run() == nil
+}
+
+// reconcileTmuxTmpdir makes this process agree with the rest of the town about
+// which tmux server to talk to.
+//
+// Precedence:
+//  1. An explicit TMUX_TMPDIR in the environment always wins, and is recorded
+//     so later invocations inherit it.
+//  2. Otherwise a previously recorded tmpdir is adopted, but only if its socket
+//     is actually present — a stale record must never hide a live default-dir
+//     server.
+//
+// Returning an error is reserved for genuinely unexpected IO problems; a
+// missing or unreadable record is normal and non-fatal.
+func reconcileTmuxTmpdir(townRoot, socket string) error {
+	recordPath := filepath.Join(townRoot, tmuxTmpdirFile)
+
+	if env := os.Getenv("TMUX_TMPDIR"); env != "" {
+		// Only persist when this tmpdir really hosts the socket, so a caller
+		// with an unrelated TMUX_TMPDIR cannot poison the record for others.
+		if !socketLiveIn(env, socket) {
+			return nil
+		}
+		if err := os.MkdirAll(filepath.Dir(recordPath), 0o755); err != nil {
+			return err
+		}
+		if prev, err := os.ReadFile(recordPath); err == nil && strings.TrimSpace(string(prev)) == env {
+			return nil
+		}
+		return os.WriteFile(recordPath, []byte(env+"\n"), 0o644)
+	}
+
+	data, err := os.ReadFile(recordPath)
+	if err != nil {
+		return nil // no record yet: tmux's own default applies
+	}
+	recorded := strings.TrimSpace(string(data))
+	if recorded == "" {
+		return nil
+	}
+	// Prefer whichever directory actually holds the socket. If the default
+	// location has it, leave the environment alone.
+	if socketLiveIn("", socket) {
+		return nil
+	}
+	if !socketLiveIn(recorded, socket) {
+		return nil // stale record; don't redirect to a dead server
+	}
+	return os.Setenv("TMUX_TMPDIR", recorded)
 }
 
 // sanitizeRe matches non-alphanumeric, non-hyphen characters.

@@ -136,9 +136,22 @@ func GetDefaultSocket() string {
 }
 
 // SocketDir returns the directory where tmux stores its socket files.
-// On macOS, tmux uses /tmp (not $TMPDIR which points to /var/folders/...),
-// so we must use /tmp directly rather than os.TempDir().
+//
+// tmux resolves its socket directory as $TMUX_TMPDIR/tmux-$UID when
+// TMUX_TMPDIR is set, falling back to /tmp/tmux-$UID otherwise. Honouring
+// TMUX_TMPDIR is mandatory, not cosmetic: a town started with
+// TMUX_TMPDIR=~/.tmux-tmp (as gastown.service does) keeps its sessions under
+// ~/.tmux-tmp/tmux-$UID, while a gt invocation that ignored the variable would
+// look under /tmp/tmux-$UID and find a *different, empty* server with the same
+// socket NAME. Every session then looks dead, so IsRunning() reports false and
+// stop/restart paths silently no-op while still reporting success (hq-8drm).
+//
+// On macOS, tmux deliberately uses /tmp rather than $TMPDIR (which points at
+// /var/folders/...), so the fallback must be /tmp and not os.TempDir().
 func SocketDir() string {
+	if dir := os.Getenv("TMUX_TMPDIR"); dir != "" {
+		return filepath.Join(dir, fmt.Sprintf("tmux-%d", os.Getuid()))
+	}
 	return filepath.Join("/tmp", fmt.Sprintf("tmux-%d", os.Getuid()))
 }
 

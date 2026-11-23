@@ -696,6 +696,55 @@ func GetAgentPresetByName(name string) *AgentPresetInfo {
 	return cloneAgentPresetInfo(globalRegistry.Agents[name])
 }
 
+// ResolveAgentPreset finds the preset that should supply data-driven defaults
+// (readiness prompt, process names, hooks provider, instructions file) for an
+// agent described by presetName and command.
+//
+// GetAgentPresetByName alone is not enough for custom agents declared in
+// settings/config.json: those entries typically set only command+args, where
+// command is an absolute path to a launcher such as
+// /home/user/.local/bin/gt-opencode. An exact-name lookup misses, the caller
+// falls back to Claude's defaults, and the agent inherits Claude's "❯ " ready
+// prompt and ["node","claude"] process names. Readiness detection then never
+// matches and start paths fail with "timeout waiting for runtime prompt" even
+// though the agent launched fine.
+//
+// Matching mirrors ResolveProcessNames so both agree on the same agent:
+//  1. exact preset name,
+//  2. exact command, command basename, or preset-command basename,
+//  3. the `gt-<binary>` launcher convention (gt-opencode -> opencode).
+//
+// Returns nil when nothing matches, leaving the fallback choice to the caller.
+func ResolveAgentPreset(presetName, command string) *AgentPresetInfo {
+	if p := GetAgentPresetByName(presetName); p != nil {
+		return p
+	}
+	if command == "" {
+		return nil
+	}
+
+	registryMu.Lock()
+	initRegistryLocked()
+	defer registryMu.Unlock()
+
+	cmdBase := filepath.Base(command)
+	unwrapped := strings.TrimPrefix(cmdBase, "gt-")
+
+	for _, info := range globalRegistry.Agents {
+		if info == nil || info.Command == "" {
+			continue
+		}
+		infoBase := filepath.Base(info.Command)
+		if info.Command == command ||
+			info.Command == cmdBase ||
+			infoBase == cmdBase ||
+			(strings.HasPrefix(cmdBase, "gt-") && (info.Command == unwrapped || infoBase == unwrapped)) {
+			return cloneAgentPresetInfo(info)
+		}
+	}
+	return nil
+}
+
 // ListAgentPresets returns all known agent preset names.
 func ListAgentPresets() []string {
 	registryMu.Lock()

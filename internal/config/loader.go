@@ -1941,11 +1941,18 @@ func fillRuntimeDefaults(rc *RuntimeConfig) *RuntimeConfig {
 
 	// Resolve preset for data-driven defaults.
 	// Use provider if set, otherwise try to match by command name.
+	//
+	// ResolveAgentPreset (not GetAgentPresetByName) because custom agents in
+	// settings/config.json usually declare only command+args, with command an
+	// absolute launcher path like .../gt-opencode. An exact-name lookup misses
+	// those and silently hands back Claude's defaults — Claude's "❯ " ready
+	// prompt and ["node","claude"] process names — so readiness detection can
+	// never match and starts fail with "timeout waiting for runtime prompt".
 	presetName := result.Provider
 	if presetName == "" && result.Command != "" {
 		presetName = result.Command
 	}
-	preset := GetAgentPresetByName(presetName)
+	preset := ResolveAgentPreset(presetName, result.Command)
 	if preset == nil {
 		preset = GetAgentPreset(AgentClaude) // fall back to Claude defaults
 	}
