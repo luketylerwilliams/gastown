@@ -146,9 +146,10 @@ var pluginRecordRunCmd = &cobra.Command{
 	Short: "Record a plugin run receipt",
 	Long: `Record a plugin run receipt through the canonical plugin recorder.
 
-The recorder creates an ephemeral type:plugin-run bead, closes it immediately,
-and leaves the receipt available to plugin history/cooldown queries that use
-closed beads. This keeps plugin scripts from leaking open run-log beads.`,
+The recorder creates a closed type:plugin-run bead on the tracked plane
+(committed — survives wisp-plane resets, hq-scrh), and leaves the receipt
+available to plugin history/cooldown queries. This keeps plugin scripts from
+leaking open run-log beads.`,
 	RunE: runPluginRecordRun,
 }
 

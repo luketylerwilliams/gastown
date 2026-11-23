@@ -49,8 +49,16 @@ func NewRecorder(townRoot string) *Recorder {
 	return &Recorder{townRoot: townRoot}
 }
 
-// RecordRun creates an ephemeral bead for a plugin run.
+// RecordRun creates a bead for a plugin run on the TRACKED (issues) plane.
 // This is pure data writing - the caller decides what result to record.
+//
+// Receipts must NOT be ephemeral: the wisp plane is dolt_ignored and
+// uncommitted, so any working-set reset (dolt merge/squash, server-session
+// recreation, `gt up --restore`) silently wipes it with no audit trail
+// (hq-scrh). Because plugin receipts are the only backing for the daemon
+// cooldown gate, a wiped plane means the gate reads 0 and re-dispatches
+// every heartbeat. Tracked-plane beads are committed and survive resets;
+// their growth is bounded by the `gt compact` plugin-receipt reap.
 func (r *Recorder) RecordRun(record PluginRunRecord) (string, error) {
 	title := record.Title
 	if title == "" {
@@ -68,10 +76,11 @@ func (r *Recorder) RecordRun(record PluginRunRecord) (string, error) {
 	}
 	labels = append(labels, record.ExtraLabels...)
 
-	// Build bd create command
+	// Build bd create command. No --ephemeral: receipts live on the
+	// tracked plane so cooldown-gate state survives wisp-plane resets
+	// (hq-scrh). See RecordRun docs.
 	args := []string{
 		"create",
-		"--ephemeral",
 		"--json",
 		"-t", "chore",
 		"--title=" + title,
@@ -139,6 +148,13 @@ func (r *Recorder) queryRuns(pluginName string, limit int, since string) ([]*Plu
 		"list",
 		"--json",
 		"--all", // Include closed beads too
+		// --include-ephemeral covers legacy receipts recorded on the wisp
+		// plane before the hq-scrh fix (they are wiped by working-set
+		// resets, so this only buys visibility until then). For the
+		// tracked-plane receipts created since, it is a no-op. Without it,
+		// the cooldown gate and `gt plugin history` were blind to every
+		// wisp-plane run on bd >= 1.3.4 (hq-yunu).
+		"--include-ephemeral",
 		"-l", "type:plugin-run",
 		"-l", fmt.Sprintf("plugin:%s", pluginName),
 	}

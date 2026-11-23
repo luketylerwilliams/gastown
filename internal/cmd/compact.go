@@ -34,13 +34,22 @@ var defaultTTLs = map[string]time.Duration{
 	"default":    24 * time.Hour,
 }
 
+// pluginReceiptTTL bounds retention of closed plugin-run receipts on the
+// TRACKED plane. Receipts (type:plugin-run, created closed by
+// plugin.Recorder.RecordRun) back the daemon cooldown gate — whose longest
+// observed cooldown is 6h — and `gt plugin history`. Seven days keeps a
+// week of audit history while bounding town-store growth from dispatch
+// receipts, which would otherwise accumulate unbounded (hq-scrh).
+const pluginReceiptTTL = 7 * 24 * time.Hour
+
 // compactResult tracks what happened to each wisp during compaction.
 type compactResult struct {
-	Promoted         []compactAction `json:"promoted"`
-	Deleted          []compactAction `json:"deleted"`
-	Skipped          int             `json:"skipped"`            // wisps still within TTL
-	OrphanedWispDeps int             `json:"orphaned_wisp_deps"` // stale wisp_dependencies removed
-	Errors           []string        `json:"errors,omitempty"`
+	Promoted             []compactAction `json:"promoted"`
+	Deleted              []compactAction `json:"deleted"`
+	Skipped              int             `json:"skipped"`              // wisps still within TTL
+	OrphanedWispDeps     int             `json:"orphaned_wisp_deps"`   // stale wisp_dependencies removed
+	PluginReceiptsReaped int             `json:"plugin_receipts_reaped"` // stale closed plugin-run receipts deleted
+	Errors               []string        `json:"errors,omitempty"`
 }
 
 type compactAction struct {
@@ -257,6 +266,10 @@ func runCompact(cmd *cobra.Command, args []string) error {
 		}
 	}
 
+	// Reap closed plugin-run receipts on the tracked plane that have aged
+	// past pluginReceiptTTL (hq-scrh). Respects --dry-run internally.
+	reapPluginReceipts(bd, now, result)
+
 	// Clean up orphaned wisp_dependencies left behind by deleted wisps.
 	// When bd delete removes a wisp, it doesn't cascade-delete dependency
 	// records in wisp_dependencies that reference the deleted wisp. Over many
@@ -274,6 +287,60 @@ func runCompact(cmd *cobra.Command, args []string) error {
 
 	printCompactSummary(result)
 	return nil
+}
+
+// reapPluginReceipts deletes closed plugin-run receipts (type:plugin-run)
+// older than pluginReceiptTTL from the TRACKED plane.
+//
+// Why: since hq-scrh, plugin.Recorder.RecordRun writes receipts to the
+// tracked plane (committed, survive wisp-plane resets) instead of the
+// ephemeral wisp plane. Receipts are created closed and nothing else reaps
+// them, so without this pass the town store would grow one closed bead per
+// cooldown-gated dispatch, forever. Seven days is >> the longest plugin
+// cooldown (6h), so no cooldown gate or history query loses data it needs.
+// Deletion is safe: Dolt AS OF preserves history.
+//
+// The reap runs against whichever store `gt compact` targets; plugin
+// receipts live in the town store, so this is a no-op on rig stores.
+func reapPluginReceipts(bd *beads.Beads, now time.Time, result *compactResult) {
+	cutoff := now.Add(-pluginReceiptTTL).UTC().Format(time.RFC3339)
+	out, err := bd.Run("list", "--json", "--all",
+		"--status", "closed",
+		"--created-before", cutoff,
+		"-l", "type:plugin-run",
+		"-n", "0")
+	if err != nil {
+		result.Errors = append(result.Errors, fmt.Sprintf("plugin receipt reap: %v", err))
+		return
+	}
+
+	var receipts []*compactIssue
+	if err := json.Unmarshal(extractJSONArray(out), &receipts); err != nil {
+		result.Errors = append(result.Errors, fmt.Sprintf("plugin receipt reap: parsing list: %v", err))
+		return
+	}
+
+	for _, r := range receipts {
+		if compactDryRun {
+			result.PluginReceiptsReaped++
+			if !compactJSON {
+				fmt.Printf("  %s reap    %s %s (plugin receipt past %s)\n",
+					style.Dim.Render("[dry-run]"), r.ID, compactTruncate(r.Title, 40), pluginReceiptTTL)
+			}
+			continue
+		}
+
+		// bd delete --force (safe: Dolt AS OF preserves history)
+		if _, err := bd.Run("delete", r.ID, "--force"); err != nil {
+			result.Errors = append(result.Errors, fmt.Sprintf("reap %s: %v", r.ID, err))
+			continue
+		}
+		result.PluginReceiptsReaped++
+		if compactVerbose && !compactJSON {
+			fmt.Printf("  %s reap    %s %s (plugin receipt past %s)\n",
+				style.Dim.Render("reap"), r.ID, compactTruncate(r.Title, 40), pluginReceiptTTL)
+		}
+	}
 }
 
 // cleanOrphanedWispDeps removes wisp_dependencies rows where either side no
@@ -305,8 +372,12 @@ func cleanOrphanedWispDeps(bd *beads.Beads, result *compactResult) {
 // listWisps queries all ephemeral issues from the database.
 // Returns extended issue structs with comment_count and wisp_type.
 func listWisps(bd *beads.Beads) ([]*compactIssue, error) {
-	// Use bd list --json --all to get wisps in all statuses, unlimited
-	out, err := bd.Run("list", "--json", "--all", "-n", "0")
+	// Use bd list --json --all to get wisps in all statuses, unlimited.
+	// --include-ephemeral is required: on bd >= 1.3.4 the wisp plane is
+	// hidden from bd list unless explicitly requested, so without it the
+	// Ephemeral filter below always matches 0 rows and TTL compaction is
+	// a no-op (hq-yunu).
+	out, err := bd.Run("list", "--json", "--all", "--include-ephemeral", "-n", "0")
 	if err != nil {
 		return nil, err
 	}
@@ -343,6 +414,39 @@ func extractJSONArray(data []byte) []byte {
 		return data
 	}
 	return data[idx:]
+}
+
+// safeWispID reports whether id is a plain beads ID (lowercase alphanumeric and
+// hyphens). Wisp IDs come from the beads database, but the audit insert
+// interpolates the ID into SQL, so guard anyway.
+func safeWispID(id string) bool {
+	if id == "" || len(id) > 255 {
+		return false
+	}
+	for _, r := range id {
+		if !(r >= 'a' && r <= 'z' || r >= '0' && r <= '9' || r == '-') {
+			return false
+		}
+	}
+	return true
+}
+
+// recordCompactDeletionAudit inserts a 'deleted' wisp_events row for a wisp
+// being removed by gt compact (hq-yunu Bug 3, TODO b). Best-effort: returns
+// an error (which the caller records) on failure.
+func recordCompactDeletionAudit(bd *beads.Beads, wispID string) error {
+	if !safeWispID(wispID) {
+		return fmt.Errorf("refusing to audit unsafe wisp ID %q", wispID)
+	}
+	// Reason is internal (TTL label), but keep it out of the SQL string to be
+	// safe: only the ID is interpolated.
+	const q = `INSERT INTO wisp_events (issue_id, event_type, actor, old_value, new_value, comment, created_at)
+	VALUES (%s, 'deleted', 'gt-compact', 'closed', NULL, 'deleted by gt compact (TTL expired)', NOW())`
+	query := fmt.Sprintf(q, wispID)
+	if _, err := bd.Run("sql", query); err != nil {
+		return err
+	}
+	return nil
 }
 
 // promoteWisp makes a wisp permanent by setting --persistent and adding a comment.
@@ -389,6 +493,16 @@ func deleteWisp(bd *beads.Beads, w *compactIssue, reason string, result *compact
 		return
 	}
 
+	// hq-yunu Bug 3 (TODO b): record a 'deleted' wisp_events audit row BEFORE
+	// the delete. `bd delete` has no cascade logic for wisp-level tables, so
+	// the row survives as a durable marker that this wisp was compacted away.
+	// Without it, a compacted wisp leaves only its pre-delete event rows and
+	// no trace that it was deleted. Best-effort: an audit failure is recorded
+	// but does not block the delete (Dolt AS OF still preserves history).
+	if err := recordCompactDeletionAudit(bd, w.ID); err != nil {
+		result.Errors = append(result.Errors, fmt.Sprintf("audit %s deleted row: %v", w.ID, err))
+	}
+
 	// bd delete --force (safe: Dolt AS OF preserves history)
 	_, err := bd.Run("delete", w.ID, "--force")
 	if err != nil {
@@ -419,6 +533,13 @@ func printCompactSummary(result *compactResult) {
 	fmt.Printf("  Promoted: %d\n", promoted)
 	fmt.Printf("  Deleted:  %d\n", deleted)
 	fmt.Printf("  Skipped:  %d (within TTL)\n", result.Skipped)
+	if result.PluginReceiptsReaped > 0 {
+		verbcap := "Reaped"
+		if compactDryRun {
+			verbcap = "Would reap"
+		}
+		fmt.Printf("  %s:     %d stale plugin receipt(s)\n", verbcap, result.PluginReceiptsReaped)
+	}
 	if result.OrphanedWispDeps > 0 {
 		fmt.Printf("  Cleaned:  %d orphaned wisp dependency ref(s)\n", result.OrphanedWispDeps)
 	}

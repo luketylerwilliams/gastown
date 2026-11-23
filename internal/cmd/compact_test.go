@@ -269,6 +269,21 @@ func TestLoadTTLConfigWithRoleSkipsInvalidPaths(t *testing.T) {
 	}
 }
 
+func TestListWispsIncludesEphemeralPlane(t *testing.T) {
+	data, err := os.ReadFile("compact.go")
+	if err != nil {
+		t.Fatalf("read compact.go: %v", err)
+	}
+	body := compactSourceBetween(t, string(data), "func listWisps(", "// extractJSONArray")
+	// On bd >= 1.3.4 the wisp plane is hidden from `bd list` unless
+	// --include-ephemeral is passed. Without it listWisps always returns
+	// 0 rows and TTL compaction is a no-op (hq-yunu: deacon observed
+	// "Compacting 0 wisps" while 235 wisps sat in the hq store).
+	if !strings.Contains(body, `"--include-ephemeral"`) {
+		t.Fatalf("listWisps must pass --include-ephemeral to bd list, got:\n%s", body)
+	}
+}
+
 func TestCleanOrphanedWispDepsUsesTypedTargets(t *testing.T) {
 	data, err := os.ReadFile("compact.go")
 	if err != nil {
@@ -287,6 +302,42 @@ func TestCleanOrphanedWispDepsUsesTypedTargets(t *testing.T) {
 		if !strings.Contains(body, want) {
 			t.Fatalf("cleanOrphanedWispDeps missing %q:\n%s", want, body)
 		}
+	}
+}
+
+// TestReapPluginReceiptsTargetsTrackedClosedPlane pins the hq-scrh reap:
+// plugin receipts now live on the TRACKED plane (committed, survive
+// wisp-plane resets), and the compact pass must delete only CLOSED receipts
+// older than the TTL. It must NOT touch the ephemeral wisp plane (legacy
+// wisp receipts are wisp_reaper's jurisdiction) and must delete with
+// --force so Dolt AS OF preserves history.
+func TestReapPluginReceiptsTargetsTrackedClosedPlane(t *testing.T) {
+	data, err := os.ReadFile("compact.go")
+	if err != nil {
+		t.Fatalf("read compact.go: %v", err)
+	}
+	body := compactSourceBetween(t, string(data), "func reapPluginReceipts(", "// cleanOrphanedWispDeps")
+	for _, want := range []string{
+		`"--status", "closed"`,
+		`"--created-before", cutoff`,
+		`"-l", "type:plugin-run"`,
+		`"delete", r.ID, "--force"`,
+	} {
+		if !strings.Contains(body, want) {
+			t.Fatalf("reapPluginReceipts missing %q:\n%s", want, body)
+		}
+	}
+	if strings.Contains(body, "--include-ephemeral") {
+		t.Fatalf("reapPluginReceipts must not target the ephemeral wisp plane:\n%s", body)
+	}
+}
+
+// TestPluginReceiptTTLMargin guards the reap against a TTL so short that a
+// cooldown gate would lose receipts it still needs: the longest production
+// plugin cooldown is 6h (dolt-log-rotate), and 24h+ leaves a wide margin.
+func TestPluginReceiptTTLMargin(t *testing.T) {
+	if pluginReceiptTTL < 24*time.Hour {
+		t.Fatalf("pluginReceiptTTL = %v, want >= 24h (margin over longest 6h plugin cooldown)", pluginReceiptTTL)
 	}
 }
 

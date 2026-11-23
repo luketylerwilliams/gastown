@@ -27,6 +27,10 @@ func TestPluginRunRecord(t *testing.T) {
 	}
 }
 
+// TestRecordRunCreatesAndClosesReceipt pins the hq-scrh behavior: receipts
+// are created on the TRACKED plane (no --ephemeral) and closed immediately.
+// Ephemeral (wisp-plane) receipts are dolt_ignored and get wiped by any
+// working-set reset, which silently breaks the daemon cooldown gate.
 func TestRecordRunCreatesAndClosesReceipt(t *testing.T) {
 	townRoot := t.TempDir()
 	binDir := t.TempDir()
@@ -67,7 +71,7 @@ func TestRecordRunCreatesAndClosesReceipt(t *testing.T) {
 	}
 	log := string(data)
 	for _, want := range []string{
-		"create --ephemeral --json -t chore --title=tool-updater: failed=brew",
+		"create --json -t chore --title=tool-updater: failed=brew",
 		"-l type:plugin-run",
 		"-l plugin:tool-updater",
 		"-l result:warning",
@@ -75,6 +79,64 @@ func TestRecordRunCreatesAndClosesReceipt(t *testing.T) {
 		"-l source:test",
 		"--description=brew failed",
 		"close gt-test-run --reason plugin run recorded",
+	} {
+		if !strings.Contains(log, want) {
+			t.Fatalf("fake bd log missing %q in:\n%s", want, log)
+		}
+	}
+
+	// hq-scrh guard: --ephemeral must NOT appear anywhere in the receipt
+	// write path. Ephemeral receipts live on the dolt_ignored wisp plane,
+	// which working-set resets (dolt merge/squash, server recreation,
+	// `gt up --restore`) wipe with no audit trail — silently breaking the
+	// daemon cooldown gate and `gt plugin history`.
+	if strings.Contains(log, "--ephemeral") {
+		t.Fatalf("RecordRun must not create ephemeral receipts (hq-scrh), got:\n%s", log)
+	}
+}
+
+// TestCountRunsSinceQueriesEphemeralPlane pins the hq-yunu regression:
+// plugin receipts are recorded as ephemeral beads (wisp plane), which
+// bd list hides by default on bd >= 1.3.4. Without --include-ephemeral
+// queryRuns always returns 0 rows, so the daemon cooldown gate is
+// silently unenforced and `gt plugin history` is always empty.
+func TestCountRunsSinceQueriesEphemeralPlane(t *testing.T) {
+	townRoot := t.TempDir()
+	binDir := t.TempDir()
+	logPath := filepath.Join(t.TempDir(), "bd-args.log")
+	bdPath := filepath.Join(binDir, "bd")
+	fakeBD := "#!/usr/bin/env bash\n" +
+		"printf '%s\\n' \"$*\" >> \"$BD_ARGS_LOG\"\n" +
+		"case \"$1\" in\n" +
+		"  list) printf '[]\\n' ;;\n" +
+		"  *) exit 0 ;;\n" +
+		"esac\n"
+	if err := os.WriteFile(bdPath, []byte(fakeBD), 0755); err != nil {
+		t.Fatalf("write fake bd: %v", err)
+	}
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	t.Setenv("BD_ARGS_LOG", logPath)
+
+	recorder := NewRecorder(townRoot)
+	n, err := recorder.CountRunsSince("beads-sync", "15m")
+	if err != nil {
+		t.Fatalf("CountRunsSince failed: %v", err)
+	}
+	if n != 0 {
+		t.Fatalf("CountRunsSince = %d, want 0 for empty list", n)
+	}
+
+	data, err := os.ReadFile(logPath)
+	if err != nil {
+		t.Fatalf("read fake bd log: %v", err)
+	}
+	log := string(data)
+	for _, want := range []string{
+		"list",
+		"--all",
+		"--include-ephemeral",
+		"-l type:plugin-run",
+		"-l plugin:beads-sync",
 	} {
 		if !strings.Contains(log, want) {
 			t.Fatalf("fake bd log missing %q in:\n%s", want, log)
