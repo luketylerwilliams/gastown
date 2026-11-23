@@ -391,6 +391,14 @@ type DeaconThresholds struct {
 	// HeartbeatVeryStaleThreshold is age at which heartbeat is very stale (default "15m").
 	HeartbeatVeryStaleThreshold string `json:"heartbeat_very_stale_threshold,omitempty"`
 
+	// BusyKillChecks is the number of consecutive daemon heartbeat ticks with
+	// an actively-changing (busy) deacon pane before a very-stale deacon is
+	// killed anyway. While the count is below this, the kill is deferred:
+	// a deacon mid long active turn (slow local model) shows pane progress
+	// but may legitimately exceed the heartbeat interval between heartbeat
+	// writes. Default 4. (hq-asfp)
+	BusyKillChecks *int `json:"busy_kill_checks,omitempty"`
+
 	// MaxRedispatches is max times a bead can be re-dispatched before escalating (default 3).
 	MaxRedispatches *int `json:"max_redispatches,omitempty"`
 

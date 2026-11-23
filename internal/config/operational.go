@@ -64,7 +64,19 @@ const (
 	DefaultDeaconConsecutiveFailures       = 3
 	DefaultDeaconCooldown                  = 5 * time.Minute
 	DefaultDeaconHeartbeatStaleThreshold   = 5 * time.Minute
-	DefaultDeaconHeartbeatVeryStale        = 20 * time.Minute
+	// DefaultDeaconHeartbeatVeryStale must leave margin above the patrol
+	// await-signal backoff max (15m) plus slow-model wake+boot time. The
+	// 20m value left only 5m of headroom and killed legitimate long turns
+	// on the 27B local backend (hq-wisp-gm6 RCA: kills at 26m with a ~13m
+	// near-miss margin); 30m restores it. Config-driven via
+	// operational.deacon.heartbeat_very_stale_threshold (hq-asfp).
+	DefaultDeaconHeartbeatVeryStale        = 30 * time.Minute
+	// DefaultDeaconBusyKillChecks bounds the busy-aware kill deferral: after
+	// this many consecutive ticks with pane progress, a very-stale deacon is
+	// killed anyway (a continuously active deacon that never writes a
+	// heartbeat has violated heartbeat discipline for far longer than the
+	// very-stale threshold).
+	DefaultDeaconBusyKillChecks            = 4
 	DefaultMaxRedispatches                 = 3
 	DefaultRedispatchCooldown              = 5 * time.Minute
 	DefaultMaxFeedsPerCycle                = 3
@@ -475,6 +487,17 @@ func (d *DeaconThresholds) HeartbeatVeryStaleThresholdD() time.Duration {
 		return ParseDurationOrDefault(d.HeartbeatVeryStaleThreshold, DefaultDeaconHeartbeatVeryStale)
 	}
 	return DefaultDeaconHeartbeatVeryStale
+}
+
+// BusyKillChecksD returns the configured or default busy-kill check count.
+// (hq-asfp: bounds the busy-aware pre-kill deferral.)
+func (d *DeaconThresholds) BusyKillChecksD() int {
+	if d != nil && d.BusyKillChecks != nil {
+		if *d.BusyKillChecks > 0 {
+			return *d.BusyKillChecks
+		}
+	}
+	return DefaultDeaconBusyKillChecks
 }
 
 // MaxRedispatchesV returns the configured or default max redispatches.

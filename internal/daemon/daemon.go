@@ -2,7 +2,9 @@ package daemon
 
 import (
 	"context"
+	"crypto/sha256"
 	"database/sql"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -76,6 +78,15 @@ type Daemon struct {
 	// See: https://github.com/steveyegge/gastown/issues/567
 	// Note: Only accessed from heartbeat loop goroutine - no sync needed.
 	deaconLastStarted time.Time
+
+	// Busy-aware pre-kill state (hq-asfp): deaconBusyHash is the SHA-256 of
+	// the last captured deacon pane; deaconBusyChecks counts consecutive
+	// heartbeat ticks where the pane changed (active turn) while the
+	// heartbeat was very stale. A changing pane defers the kill up to
+	// BusyKillChecksD() ticks. Only accessed from the heartbeat loop
+	// goroutine - no sync needed.
+	deaconBusyHash   string
+	deaconBusyChecks int
 
 	// syncFailures tracks consecutive git pull failures per workdir.
 	// Used to escalate logging from WARN to ERROR after repeated failures.
@@ -1525,6 +1536,32 @@ func (d *Daemon) deaconGracePeriod() time.Duration {
 	return d.loadOperationalConfig().GetDaemonConfig().DeaconGracePeriodD()
 }
 
+// captureDeaconPane captures the deacon's pane and reports whether its content
+// changed since the previous capture. A changing pane indicates an active turn
+// (progress), as opposed to a hung session showing a static prompt (hq-asfp).
+// On success it updates deaconBusyHash to this capture so the NEXT tick
+// compares against this one (~one daemon tick, typically 3m, is the change
+// window). Only called from the heartbeat loop goroutine - no sync needed.
+//
+// Returns false (not busy) when the pane cannot be captured: we cannot
+// distinguish busy from stuck, so fail toward the previous behavior (the kill
+// path proceeds) rather than deferring forever on capture errors.
+func (d *Daemon) captureDeaconPane(sessionName string) bool {
+	if d.tmux == nil {
+		return false
+	}
+	pane, err := d.tmux.CapturePane(sessionName, 30)
+	if err != nil {
+		d.logger.Printf("Busy check: pane capture failed for %s: %v (treating as not busy)", sessionName, err)
+		return false
+	}
+	sum := sha256.Sum256([]byte(pane))
+	hash := hex.EncodeToString(sum[:])
+	changed := hash != d.deaconBusyHash
+	d.deaconBusyHash = hash
+	return changed
+}
+
 // checkDeaconHeartbeat checks if the Deacon is making progress.
 // This is a belt-and-suspenders fallback in case Boot doesn't detect stuck states.
 // Uses the heartbeat file that the Deacon updates on each patrol cycle.
@@ -1575,10 +1612,37 @@ func (d *Daemon) checkDeaconHeartbeat() {
 					timeSinceStart.Round(time.Second))
 				return
 			}
-			// Grace period expired but heartbeat still from before start
+			// Grace period expired but heartbeat still from before start.
+			// Busy-aware pre-kill (hq-asfp/hq-65zl): this branch used to kill
+			// unconditionally, but the check cadence (~15m) lands the first
+			// post-start check well past the 5m grace, so a FRESH deacon whose
+			// first turn is a long hook-work turn (slow local model: re-claim
+			// hooked work + re-read specs, no post-start heartbeat write yet)
+			// was restarted on its very first check — and every respawn
+			// repeated the same long first turn (hq-65zl: 3 consecutive fresh
+			// instances killed 11:08-11:38Z on 2026-11-23). Same pane-change
+			// busy check as the very-stale branch: a changing pane shows an
+			// active turn, so defer (bounded by BusyKillChecks); a static pane
+			// is a real hang and the kill proceeds (one tick after the capture
+			// baseline is established).
+			if d.captureDeaconPane(sessionName) {
+				d.deaconBusyChecks++
+				if busyLimit := d.loadOperationalConfig().GetDeaconConfig().BusyKillChecksD(); d.deaconBusyChecks < busyLimit {
+					d.logger.Printf("BUSY DEACON: started %s ago, heartbeat pre-restart but pane shows progress (busy check %d/%d) — deferring kill",
+						timeSinceStart.Round(time.Minute), d.deaconBusyChecks, busyLimit)
+					return
+				}
+				d.logger.Printf("BUSY DEACON: pane active for %d consecutive ticks with no post-start heartbeat — proceeding with kill", d.deaconBusyChecks)
+			} else {
+				d.deaconBusyChecks = 0
+			}
+
 			// Stuck-agent-dog: kill and restart
 			d.logger.Printf("STUCK DEACON: started %s ago but heartbeat still pre-restart (session: %s)",
 				timeSinceStart.Round(time.Minute), sessionName)
+			// Reset busy state: the respawned session starts a fresh pane.
+			d.deaconBusyHash = ""
+			d.deaconBusyChecks = 0
 			d.restartStuckDeacon(sessionName, fmt.Sprintf("heartbeat pre-restart after %s", timeSinceStart.Round(time.Minute)))
 			return
 		}
@@ -1595,8 +1659,17 @@ func (d *Daemon) checkDeaconHeartbeat() {
 
 	age := hb.Age()
 
-	// If heartbeat is fresh (< 5 min), nothing to do
-	if hb.IsFresh() {
+	// Config-driven thresholds (hq-asfp): the operational.deacon knobs used
+	// to be dead config — this kill path read the compiled constants from
+	// deacon.Heartbeat, so heartbeat_stale_threshold / heartbeat_very_stale_threshold
+	// in settings/config.json had no effect.
+	thresholds := d.loadOperationalConfig().GetDeaconConfig()
+
+	// If heartbeat is fresh (below the stale threshold), nothing to do.
+	if age < thresholds.HeartbeatStaleThresholdD() {
+		// Fresh heartbeat — reset busy-aware tracking.
+		d.deaconBusyHash = ""
+		d.deaconBusyChecks = 0
 		return
 	}
 
@@ -1615,13 +1688,42 @@ func (d *Daemon) checkDeaconHeartbeat() {
 		return
 	}
 
+	// Capture the pane now so the busy check below compares against a capture
+	// from ~one daemon tick ago (the "pane changed within the last 3m" window,
+	// hq-asfp). Capturing on every stale tick (including the nudge tier) keeps
+	// the comparison current when the heartbeat crosses into very-stale.
+	paneChanged := d.captureDeaconPane(sessionName)
+
 	// Session exists but heartbeat is stale - Deacon may be stuck.
-	// Two-tier response: nudge for stale (5-20 min), kill and restart
-	// only for very stale (>= 20 min). Kill threshold must be > backoff-max
+	// Two-tier response: nudge for stale (stale→very-stale), kill and restart
+	// only for very stale. Kill threshold must be > backoff-max
 	// to avoid false positive kills during legitimate await-signal sleep.
-	if hb.IsVeryStale() {
+	if age >= thresholds.HeartbeatVeryStaleThresholdD() {
+		// Busy-aware pre-kill (hq-asfp): a deacon mid long active turn
+		// (slow local model: plugin runs, wisp compaction, patrol digests)
+		// is indistinguishable from a hang by heartbeat age alone. A pane
+		// whose content changed since the last capture shows progress, so
+		// the session is BUSY, not STUCK: log and defer the kill. After
+		// BusyKillChecks consecutive busy ticks the session has been
+		// continuously active with no heartbeat for far longer than
+		// heartbeat discipline allows, so the kill proceeds.
+		if paneChanged {
+			d.deaconBusyChecks++
+			if busyLimit := thresholds.BusyKillChecksD(); d.deaconBusyChecks < busyLimit {
+				d.logger.Printf("BUSY DEACON: heartbeat stale for %s but pane shows progress (busy check %d/%d) — deferring kill",
+					age.Round(time.Minute), d.deaconBusyChecks, busyLimit)
+				return
+			}
+			d.logger.Printf("BUSY DEACON: pane active for %d consecutive ticks with no heartbeat — proceeding with kill", d.deaconBusyChecks)
+		} else {
+			d.deaconBusyChecks = 0
+		}
+
 		// Stuck-agent-dog: kill and restart
 		d.logger.Printf("STUCK DEACON: heartbeat stale for %s, session %s needs restart", age.Round(time.Minute), sessionName)
+		// Reset busy state: the respawned session starts a fresh pane.
+		d.deaconBusyHash = ""
+		d.deaconBusyChecks = 0
 		d.restartStuckDeacon(sessionName, fmt.Sprintf("heartbeat stale for %s", age.Round(time.Minute)))
 	} else {
 		// Stale but not very stale (5-20 min) - nudge to wake up (unless idle).

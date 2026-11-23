@@ -13,6 +13,10 @@ import (
 // Heartbeat age thresholds — these are compiled-in defaults.
 // Configurable via operational.deacon.heartbeat_stale_threshold and
 // operational.deacon.heartbeat_very_stale_threshold in settings/config.json.
+// The daemon's kill path (checkDeaconHeartbeat) reads the config values via
+// DeaconThresholds accessors; these constants remain as fallbacks for callers
+// that cannot load operational config (e.g. gt deacon status display) and
+// must stay in sync with the config defaults (hq-asfp).
 const (
 	// HeartbeatStaleThreshold is the age at which a heartbeat is considered stale.
 	HeartbeatStaleThreshold = 5 * time.Minute
@@ -20,8 +24,9 @@ const (
 	// HeartbeatVeryStaleThreshold is the age at which a heartbeat is considered
 	// very stale, meaning the Deacon should be poked or restarted.
 	// Must be greater than patrol backoff-max (15m) to avoid false positives
-	// during legitimate await-signal sleep.
-	HeartbeatVeryStaleThreshold = 20 * time.Minute
+	// during legitimate await-signal sleep, with extra margin for slow-model
+	// wake+boot (20m left only 5m of headroom — hq-wisp-gm6 RCA, hq-asfp).
+	HeartbeatVeryStaleThreshold = 30 * time.Minute
 )
 
 // Heartbeat represents the Deacon's heartbeat file contents.
@@ -115,7 +120,8 @@ func (hb *Heartbeat) IsFresh() bool {
 	return hb != nil && hb.Age() < HeartbeatStaleThreshold
 }
 
-// IsStale returns true if the heartbeat is 5-20 minutes old.
+// IsStale returns true if the heartbeat is between the stale and very-stale
+// thresholds (defaults: 5-30 minutes).
 // A stale heartbeat may indicate the Deacon is doing a long operation.
 func (hb *Heartbeat) IsStale() bool {
 	if hb == nil {
@@ -125,7 +131,9 @@ func (hb *Heartbeat) IsStale() bool {
 	return age >= HeartbeatStaleThreshold && age < HeartbeatVeryStaleThreshold
 }
 
-// IsVeryStale returns true if the heartbeat is more than 20 minutes old.
+// IsVeryStale returns true if the heartbeat is older than the very-stale
+// threshold (default 30m; the daemon kill path reads the configured
+// operational.deacon.heartbeat_very_stale_threshold instead — hq-asfp).
 // A very stale heartbeat means the Deacon should be poked.
 func (hb *Heartbeat) IsVeryStale() bool {
 	return hb == nil || hb.Age() >= HeartbeatVeryStaleThreshold

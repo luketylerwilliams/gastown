@@ -633,7 +633,32 @@ func purgeClosedWisps(db *sql.DB, dbName string, purgeAge time.Duration, dryRun 
 		DefaultBatchSize)
 	auxTables := []string{"wisp_labels", "wisp_comments", "wisp_events", "wisp_dependencies"}
 
-	totalDeleted, err := batchDeleteRows(ctx, db, idQuery, deleteCutoff, "wisps", auxTables)
+	// hq-yunu Bug 3 (TODO b): the purge removes the wisp rows AND their
+	// wisp_events history, so a purged wisp would leave no trace in the live
+	// database. Record a 'deleted' audit row per purged wisp (inserted after
+	// each batch's deletes, within the same transaction) so the purge is
+	// distinguishable from uncommitted working-set loss when a wisp vanishes
+	// unexpectedly (e.g. a plugin receipt disappearing before its TTL).
+	var onBatchDeleted func(ctx context.Context, ids []string) error
+	if hasEvents, err := tableExists(ctx, db, "wisp_events"); err != nil {
+		anomalies = append(anomalies, Anomaly{
+			Type:    "wisp_events_check_failed",
+			Message: fmt.Sprintf("wisp_events table check failed, deletion audit disabled: %v", err),
+		})
+	} else if hasEvents {
+		onBatchDeleted = func(ctx context.Context, ids []string) error {
+			if err := recordWispDeletionAudit(ctx, db, ids); err != nil {
+				anomalies = append(anomalies, Anomaly{
+					Type:    "wisp_delete_audit_failed",
+					Message: fmt.Sprintf("failed to record %d wisp_events deleted rows: %v", len(ids), err),
+				})
+				return err
+			}
+			return nil
+		}
+	}
+
+	totalDeleted, err := batchDeleteRows(ctx, db, idQuery, deleteCutoff, "wisps", auxTables, onBatchDeleted)
 	if err != nil {
 		return totalDeleted, anomalies, err
 	}
@@ -658,6 +683,34 @@ func purgeClosedWisps(db *sql.DB, dbName string, purgeAge time.Duration, dryRun 
 	}
 
 	return totalDeleted, anomalies, nil
+}
+
+// recordWispDeletionAudit inserts a 'deleted' wisp_events audit row for each
+// purged wisp (hq-yunu Bug 3, TODO b). Called from the batchDeleteRows audit
+// hook after the batch's deletes, inside the purge's open transaction — the
+// rows are flushed by the same COMMIT + DOLT_COMMIT that records the delete.
+//
+// The audit rows outlive the wisps: the wisps rows (and their event history)
+// are gone, so issue_id dangles by design. That is the point — when a wisp
+// vanishes from the live database, a 'deleted' row here proves the reaper
+// purged it, whereas no row points at uncommitted working-set loss.
+func recordWispDeletionAudit(ctx context.Context, db *sql.DB, ids []string) error {
+	if len(ids) == 0 {
+		return nil
+	}
+	placeholders := make([]string, 0, len(ids))
+	args := make([]interface{}, 0, len(ids))
+	for _, id := range ids {
+		// One VALUES tuple per wisp: id is the only dynamic value.
+		placeholders = append(placeholders, "(?, 'deleted', 'wisp_reaper', 'closed', NULL, ?, NOW())")
+		args = append(args, id, "purged: closed wisp past delete_age (reaper)")
+	}
+	insertQuery := "INSERT INTO wisp_events (issue_id, event_type, actor, old_value, new_value, comment, created_at) VALUES " +
+		strings.Join(placeholders, ", ")
+	if _, err := db.ExecContext(ctx, insertQuery, args...); err != nil {
+		return fmt.Errorf("insert wisp_events deleted rows: %w", err)
+	}
+	return nil
 }
 
 func purgeOldMail(db *sql.DB, dbName string, mailDeleteAge time.Duration, dryRun bool) (int, error) {
@@ -696,7 +749,7 @@ func purgeOldMail(db *sql.DB, dbName string, mailDeleteAge time.Duration, dryRun
 		dbName, dbName, DefaultBatchSize)
 	auxTables := []string{"labels", "comments", "events", "dependencies"}
 
-	totalDeleted, err := batchDeleteRows(ctx, db, idQuery, mailCutoff, "issues", auxTables)
+	totalDeleted, err := batchDeleteRows(ctx, db, idQuery, mailCutoff, "issues", auxTables, nil)
 	if err != nil {
 		return totalDeleted, err
 	}
@@ -847,7 +900,11 @@ func AutoClose(db *sql.DB, dbName string, staleAge time.Duration, dryRun bool) (
 }
 
 // batchDeleteRows deletes rows from a primary table and its auxiliary tables in batches.
-func batchDeleteRows(ctx context.Context, db *sql.DB, idQuery string, cutoffArg time.Time, primaryTable string, auxTables []string) (int, error) {
+// onBatchDeleted is an optional audit hook invoked after each batch's deletes, within
+// the same SQL transaction (pass nil for no audit). It receives the batch's row IDs.
+// Errors from the hook are non-fatal — an audit trail is best-effort, matching the
+// non-fatal aux-table delete handling.
+func batchDeleteRows(ctx context.Context, db *sql.DB, idQuery string, cutoffArg time.Time, primaryTable string, auxTables []string, onBatchDeleted func(ctx context.Context, ids []string) error) (int, error) {
 	totalDeleted := 0
 	for {
 		idRows, err := db.QueryContext(ctx, idQuery, cutoffArg)
@@ -912,6 +969,13 @@ func batchDeleteRows(ctx context.Context, db *sql.DB, idQuery string, cutoffArg 
 		}
 		affected, _ := sqlResult.RowsAffected()
 		totalDeleted += int(affected)
+
+		if onBatchDeleted != nil {
+			// Runs after this batch's deletes: audit rows inserted here survive
+			// the batch's own aux-table cleanup (which removes the deleted rows'
+			// historical event rows).
+			_ = onBatchDeleted(ctx, ids)
+		}
 	}
 
 	return totalDeleted, nil
