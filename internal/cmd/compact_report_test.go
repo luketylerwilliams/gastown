@@ -585,6 +585,74 @@ func TestRunWeeklyRollupStopsBeforeMailWhenAuditCloseFails(t *testing.T) {
 	assertNoMailSent(t, mailLog)
 }
 
+func TestFindExistingWeeklyRollupSeesClosedAuditBead(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("shell script command stubs not supported on Windows")
+	}
+	binDir := t.TempDir()
+	argsLog := filepath.Join(t.TempDir(), "bd-args.log")
+	bdScript := `#!/bin/sh
+printf '%s\n' "$*" >> "$BD_ARGS_LOG"
+printf '%s\n' '[{"id":"hq-5sv","title":"Weekly Compaction Rollup 2026-11-16 to 2026-11-23"}]'
+`
+	if err := os.WriteFile(filepath.Join(binDir, "bd"), []byte(bdScript), 0755); err != nil {
+		t.Fatalf("write fake bd: %v", err)
+	}
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	t.Setenv("BD_ARGS_LOG", argsLog)
+
+	id, err := findExistingWeeklyRollup("2026-11-16", "2026-11-23")
+	if err != nil {
+		t.Fatalf("findExistingWeeklyRollup: %v", err)
+	}
+	if id != "hq-5sv" {
+		t.Fatalf("id = %q, want hq-5sv (closed audit bead must match, hq-h2h)", id)
+	}
+
+	args, err := os.ReadFile(argsLog)
+	if err != nil {
+		t.Fatalf("read bd args: %v", err)
+	}
+	if !strings.Contains(string(args), "--all") {
+		t.Fatalf("bd args = %q, want --all (all statuses)", string(args))
+	}
+}
+
+func TestFindExistingCompactReportSeesOpenAuditBead(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("shell script command stubs not supported on Windows")
+	}
+	// Regression: a failed auto-close leaves the audit bead OPEN. A
+	// closed-only scan misses it and the digest re-fires every patrol cycle.
+	binDir := t.TempDir()
+	argsLog := filepath.Join(t.TempDir(), "bd-args.log")
+	bdScript := `#!/bin/sh
+printf '%s\n' "$*" >> "$BD_ARGS_LOG"
+printf '%s\n' '[{"id":"hq-a1","title":"Compaction Report 2026-05-15"}]'
+`
+	if err := os.WriteFile(filepath.Join(binDir, "bd"), []byte(bdScript), 0755); err != nil {
+		t.Fatalf("write fake bd: %v", err)
+	}
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	t.Setenv("BD_ARGS_LOG", argsLog)
+
+	id, err := findExistingCompactReport("2026-05-15")
+	if err != nil {
+		t.Fatalf("findExistingCompactReport: %v", err)
+	}
+	if id != "hq-a1" {
+		t.Fatalf("id = %q, want hq-a1 (open audit bead must match)", id)
+	}
+
+	args, err := os.ReadFile(argsLog)
+	if err != nil {
+		t.Fatalf("read bd args: %v", err)
+	}
+	if !strings.Contains(string(args), "--all") {
+		t.Fatalf("bd args = %q, want --all (all statuses)", string(args))
+	}
+}
+
 func resetCompactReportFlags(t *testing.T) {
 	oldDryRun := compactReportDryRun
 	oldWeekly := compactReportWeekly
