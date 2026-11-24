@@ -1715,9 +1715,24 @@ func isReadyIssue(t trackedIssueInfo, scheduledSet map[string]bool) bool {
 		return false
 	}
 
-	// Scheduled beads are not stranded — they're waiting for dispatch capacity.
+	// Scheduled beads with a live polecat session are genuinely in-flight.
+	// But if the sling context exists while no polecat session is running,
+	// the bead is stuck: the scheduler won't dispatch (convoy says 0 ready)
+	// and no session exists to work it. Treat it as ready so the scheduler
+	// can spawn a polecat. (hq-convoy-deadlock: sling creates context before
+	// dispatch; dispatch requires ready; ready excludes scheduled → deadlock.)
 	if scheduledSet[t.ID] {
-		return false
+		if t.Assignee != "" {
+			sessionName, _ := assigneeToSessionName(t.Assignee)
+			if sessionName != "" {
+				checkCmd := tmux.BuildCommand("has-session", "-t", sessionName)
+				if checkCmd.Run() == nil {
+					return false // Session exists = genuinely in-flight
+				}
+				// Session dead but scheduled = stuck, treat as ready
+			}
+		}
+		// Scheduled but no assignee or no live session = ready for dispatch
 	}
 
 	// Open issues with no assignee are trivially ready
