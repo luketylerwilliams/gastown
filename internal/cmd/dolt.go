@@ -1151,6 +1151,11 @@ func runDoltCleanup(cmd *cobra.Command, args []string) error {
 		fmt.Printf("  %s Removed %s\n", style.Bold.Render("✓"), o.Name)
 		removed++
 
+		// Cleanup drops are destructive and were previously unlogged, which
+		// made the hq-b0mf7 evidence DB deletion (~17:40Z) unattributable.
+		// Record every removal in the daemon log directory (hq-m19ro).
+		logDoltCleanupRemoval(townRoot, o.Name, o.SizeBytes, doltCleanupForce)
+
 		// Health check after each DROP to catch read-only early (gt-r1cyd)
 		if readOnly, _ := doltserver.CheckReadOnly(townRoot); readOnly {
 			fmt.Printf("  %s Server went read-only after DROP — attempting recovery...\n", style.Bold.Render("!"))
@@ -1167,6 +1172,30 @@ func runDoltCleanup(cmd *cobra.Command, args []string) error {
 		style.Bold.Render("✓"), removed, len(orphans))
 
 	return nil
+}
+
+// logDoltCleanupRemoval appends an audit line for a database removal to
+// <townRoot>/logs/dolt-cleanup.log. `gt dolt cleanup` previously performed
+// destructive DROPs with no durable record, leaving the hq-b0mf7 evidence-DB
+// deletion unattributable (hq-m19ro). Best-effort: cleanup must not fail
+// because logging could not be written.
+func logDoltCleanupRemoval(townRoot, dbName string, sizeBytes int64, force bool) {
+	logDir := filepath.Join(townRoot, "logs")
+	if err := os.MkdirAll(logDir, 0755); err != nil {
+		return
+	}
+	f, err := os.OpenFile(filepath.Join(logDir, "dolt-cleanup.log"),
+		os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+	if err != nil {
+		return
+	}
+	defer f.Close()
+	user := os.Getenv("USER")
+	if user == "" {
+		user = "unknown"
+	}
+	fmt.Fprintf(f, "%s user=%s removed=%s size=%d force=%v\n",
+		time.Now().UTC().Format(time.RFC3339), user, dbName, sizeBytes, force)
 }
 
 func runDoltList(cmd *cobra.Command, args []string) error {

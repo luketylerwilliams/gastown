@@ -5196,3 +5196,19 @@ func TestHealthMetrics_CommitFreshnessFields(t *testing.T) {
 		t.Errorf("LastCommitAge = %v, want >= 0", metrics.LastCommitAge)
 	}
 }
+
+// TestProtectedSharedServerDatabases_BeadsRetained guards the hq-b0mf7/hq-m19ro
+// retention: the legacy "beads" DB (incident evidence, and a name that can hold
+// real user tables) must never be flagged orphan-removable by
+// FindOrphanedDatabases/RemoveDatabase.
+func TestProtectedSharedServerDatabases_BeadsRetained(t *testing.T) {
+	if !isProtectedSharedServerDatabase("beads") {
+		t.Error(`"beads" must be a protected shared-server database (hq-m19ro retention)`)
+	}
+	if !isProtectedSharedServerDatabase("beads_global") {
+		t.Error(`"beads_global" must remain protected`)
+	}
+	if isProtectedSharedServerDatabase("hq") {
+		t.Error(`"hq" must not be protected here — it is referenced by rig metadata`)
+	}
+}

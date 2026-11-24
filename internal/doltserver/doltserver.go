@@ -3007,6 +3007,14 @@ type OrphanedDatabase struct {
 func protectedSharedServerDatabases() map[string]string {
 	return map[string]string{
 		"beads_global": "global shared beads database (protected)",
+		// "beads" is the legacy default DB name created by older bd init and
+		// the metadata-clobber incident (hq-b0mf7). The empty legacy DB was
+		// dropped by `gt dolt cleanup` on 2026-11-24 17:40Z because it was
+		// unreferenced and unprotected, destroying incident evidence before
+		// RCA completed. Retain it (and any resurrected instance) from
+		// orphan cleanup so write-source RCA and user tables in similarly
+		// named DBs are not silently lost (hq-m19ro).
+		"beads": "legacy/default beads database — retained for RCA evidence (hq-b0mf7/hq-m19ro)",
 	}
 }
 
