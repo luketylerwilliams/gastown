@@ -1650,7 +1650,9 @@ func (d *Daemon) checkDeaconHeartbeat() {
 		}
 
 		// Heartbeat exists - check if it's from BEFORE we started this Deacon
-		if hb.Timestamp.Before(d.deaconLastStarted) {
+		// (with startup-race tolerance, hq-o31s3: a heartbeat written within
+		// deaconStartupHBWindow of the recorded start counts as post-start).
+		if !deaconHeartbeatCountsAsPostStart(hb.Timestamp, d.deaconLastStarted) {
 			// Heartbeat is stale (from before restart)
 			if timeSinceStart < d.deaconGracePeriod() {
 				d.logger.Printf("Deacon started %s ago, heartbeat is pre-restart, awaiting fresh heartbeat...",
@@ -1670,6 +1672,20 @@ func (d *Daemon) checkDeaconHeartbeat() {
 			// active turn, so defer (bounded by BusyKillChecks); a static pane
 			// is a real hang and the kill proceeds (one tick after the capture
 			// baseline is established).
+			//
+			// hq-is5lo FIX 2: process-subtree activity outranks the pane hash
+			// and does NOT count toward the kill limit. The old rule "pane
+			// active for N consecutive ticks with no post-start heartbeat —
+			// proceeding with kill" killed ACTIVE deacons whose mid-step spans
+			// outlasted the heartbeat cadence (4 reaps on 2026-11-24, fdoc-xvr
+			// class); a fresh opencode/tool spawn under the pane is direct
+			// evidence of work in flight, so the tick defers without advancing
+			// the counter.
+			if d.deaconSubtreeHasRecentActivity(sessionName) {
+				d.logger.Printf("BUSY DEACON: started %s ago, heartbeat pre-restart but pane subtree shows recent process activity — deferring kill (no kill credit)",
+					timeSinceStart.Round(time.Minute))
+				return
+			}
 			if d.captureDeaconPane(sessionName) {
 				d.deaconBusyChecks++
 				if busyLimit := d.loadOperationalConfig().GetDeaconConfig().BusyKillChecksD(); d.deaconBusyChecks < busyLimit {
@@ -1752,6 +1768,20 @@ func (d *Daemon) checkDeaconHeartbeat() {
 		// BusyKillChecks consecutive busy ticks the session has been
 		// continuously active with no heartbeat for far longer than
 		// heartbeat discipline allows, so the kill proceeds.
+		//
+		// hq-is5lo FIX 2 (activity-based kill gate): before consulting the
+		// pane hash, check the pane's process subtree for recent opencode/
+		// tool spawns. Fresh process activity is direct evidence of work in
+		// flight — defer WITHOUT counting a kill tick. The pane-hash rule
+		// alone ("pane active for N consecutive ticks ... proceeding with
+		// kill") killed working deacons whose long tool spans left the pane
+		// momentarily static between output flushes (hq-o31s3 startup-race
+		// kill fired on an ACTIVE deacon at 21:41:54Z on 2026-11-24).
+		if d.deaconSubtreeHasRecentActivity(sessionName) {
+			d.logger.Printf("BUSY DEACON: heartbeat stale for %s but pane subtree shows recent process activity — deferring kill (no kill credit)",
+				age.Round(time.Minute))
+			return
+		}
 		if paneChanged {
 			d.deaconBusyChecks++
 			if busyLimit := thresholds.BusyKillChecksD(); d.deaconBusyChecks < busyLimit {
@@ -1782,6 +1812,15 @@ func (d *Daemon) checkDeaconHeartbeat() {
 		// Conservative: on store errors hasActiveWork returns true, so nudge fires.
 		// See also: runtime/runtime.go:99-101 — session-started nudge was removed
 		// for the same reason (it interrupted the deacon's await-signal backoff).
+		//
+		// hq-is5lo FIX 2 extension: confirmed process activity means work is in
+		// flight — a nudge cannot help and interrupts nothing useful (the fdoc-xvr
+		// evidence: 70 nudge lines during continuous tool spawns; nudges were
+		// inert noise). Skip it like the no-work case.
+		if d.deaconSubtreeHasRecentActivity(sessionName) {
+			d.logger.Println("Deacon nudge skipped: pane subtree shows recent process activity (work in flight)")
+			return
+		}
 		if !d.hasActiveWork() {
 			d.logger.Println("Deacon nudge skipped: no active work in flight, await-signal will fire naturally")
 			return
