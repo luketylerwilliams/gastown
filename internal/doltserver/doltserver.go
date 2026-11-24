@@ -3764,6 +3764,14 @@ func buildDatabaseToRigMap(townRoot string) map[string]string {
 	return result
 }
 
+// rigDirExists reports whether townRoot contains an actual rig directory of
+// the given name (distinguishing a rig named "beads" from the legacy bd
+// route-path synonym for the HQ rig — hq-b0mf7).
+func rigDirExists(townRoot, rigName string) bool {
+	info, err := os.Stat(filepath.Join(townRoot, rigName))
+	return err == nil && info.IsDir()
+}
+
 // FindRigBeadsDir returns the .beads directory path for a rig (read-only lookup).
 // For "hq", returns <townRoot>/.beads.
 // For other rigs, returns <townRoot>/<rigName>/mayor/rig/.beads if it exists,
@@ -3779,6 +3787,14 @@ func FindRigBeadsDir(townRoot, rigName string) string {
 		return ""
 	}
 	if rigName == "hq" {
+		return filepath.Join(townRoot, ".beads")
+	}
+	if rigName == "beads" && !rigDirExists(townRoot, "beads") {
+		// "beads" is a synonym for the HQ rig on workspaces created by older
+		// bd versions whose route paths used "beads" instead of ".". With no
+		// actual rig directory of that name, resolving it to the content
+		// directory (townRoot/beads/.beads) let EnsureAllMetadata "correct"
+		// the town-root metadata.json to dolt_database=beads (hq-b0mf7).
 		return filepath.Join(townRoot, ".beads")
 	}
 
@@ -3819,6 +3835,11 @@ func FindOrCreateRigBeadsDir(townRoot, rigName string) (string, error) {
 			return "", fmt.Errorf("creating HQ beads dir: %w", err)
 		}
 		return dir, nil
+	}
+	if rigName == "beads" && !rigDirExists(townRoot, "beads") {
+		// Same legacy alias as FindRigBeadsDir (hq-b0mf7): no rig directory
+		// named "beads" means the town-root HQ beads dir.
+		return FindOrCreateRigBeadsDir(townRoot, "hq")
 	}
 
 	// Check mayor/rig/.beads first (canonical location).

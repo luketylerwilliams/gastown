@@ -767,6 +767,49 @@ func TestEnsureMetadata_Rig(t *testing.T) {
 	}
 }
 
+// TestEnsureMetadata_BeadsRigIsHQAlias reproduces the hq-b0mf7 town-wide mail
+// outage: a database named "beads" grouped to rigName "beads" resolved to the
+// town's beads CONTENT directory (townRoot/beads/.beads). EnsureMetadataForBeadsDir
+// then "corrected" that metadata.json — the same file via the .beads/.beads
+// self-symlink — dolt_database from "hq" to "beads", clobbering the town-root
+// metadata. With no rig directory named "beads", the alias must resolve to the
+// town-root .beads so the effective DB is "hq" and the write is a no-op.
+func TestEnsureMetadata_BeadsRigIsHQAlias(t *testing.T) {
+	townRoot := t.TempDir()
+
+	// Town-root .beads with live hq metadata (server mode).
+	beadsDir := filepath.Join(townRoot, ".beads")
+	if err := os.MkdirAll(beadsDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	live := `{"backend":"dolt","database":"dolt","dolt_mode":"server","dolt_database":"hq"}`
+	if err := os.WriteFile(filepath.Join(beadsDir, "metadata.json"), []byte(live), 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	// The beads content directory a stale route would map "beads" to.
+	if err := os.MkdirAll(filepath.Join(townRoot, "beads", ".beads"), 0755); err != nil {
+		t.Fatal(err)
+	}
+
+	// Same call EnsureAllMetadata makes for the "beads" DB candidate.
+	if err := EnsureMetadata(townRoot, "beads", "beads"); err != nil {
+		t.Fatalf("EnsureMetadata(beads) failed: %v", err)
+	}
+
+	data, err := os.ReadFile(filepath.Join(beadsDir, "metadata.json"))
+	if err != nil {
+		t.Fatalf("reading town-root metadata: %v", err)
+	}
+	var metadata map[string]interface{}
+	if err := json.Unmarshal(data, &metadata); err != nil {
+		t.Fatalf("parsing metadata: %v", err)
+	}
+	if metadata["dolt_database"] != "hq" {
+		t.Errorf("town-root dolt_database = %v, want hq (hq-b0mf7 clobber regression)", metadata["dolt_database"])
+	}
+}
+
 func TestEnsureMetadata_Idempotent(t *testing.T) {
 	townRoot := t.TempDir()
 
