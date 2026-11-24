@@ -130,6 +130,41 @@ type Daemon struct {
 	// Only accessed from heartbeat loop goroutine - no sync needed.
 	zombieFirstSeen map[string]time.Time
 
+	// refineryLivenessFixes tracks recent liveness self-heals per refinery
+	// session (silent-exit class, hq-p0aam): a dead-but-retained pane reaped
+	// plus a Manager restart. The gate suppresses the ensureRefineryRunning
+	// event gate for one patrol cycle after a classified death so a clean
+	// status-0 exit with an empty queue still gets a successor (the
+	// silent-exit class previously produced ZERO daemon respawn lines).
+	// Only accessed from heartbeat loop goroutine - no sync needed.
+	refineryLivenessFixes map[string]time.Time
+
+	// refineryPaneDeadSince tracks when a refinery session was first observed
+	// with a dead agent pane, for the hq-p0aam classification grace window.
+	// Only accessed from heartbeat loop goroutine - no sync needed.
+	refineryPaneDeadSince map[string]time.Time
+
+	// claimedRefineries lists the refinery sessions sweepRefineryLiveness
+	// handled this heartbeat; sweepZombieSessions skips these names so the
+	// refinery plane's own gate (classify + respawn) wins over kill-only
+	// reaping. Rebuilt by the sweep each heartbeat; nil until then.
+	// Only accessed from heartbeat loop goroutine - no sync needed.
+	claimedRefineries map[string]bool
+
+	// refineryAlive tracks the refinery sessions sweepRefineryLiveness saw
+	// PRESENT on a sweep. A session that was present and is now absent left no
+	// dead pane behind (remain-on-exit off destroyed it on exit) — the
+	// original ro-66o silent-exit manifestation. The sweep marks such vanishings
+	// so ensureRefineryRunning respawns them even with an empty merge queue
+	// (hq-p0aam). Only accessed from heartbeat loop goroutine - no sync needed.
+	refineryAlive map[string]bool
+
+	// refinerySafetyStopCheck is a test seam for refinery.ActiveSafetyStop.
+	// nil in production; tests override it (tmp town roots have no beads DB,
+	// and the real call would error and skip every rig).
+	// Only accessed from heartbeat loop goroutine - no sync needed.
+	refinerySafetyStopCheck func(townRoot, rigName string) (*refinery.SafetyStop, error)
+
 	// mayorZombieCount tracks consecutive patrol cycles where the Mayor tmux
 	// session exists but the agent process is not detected. A count >= 3
 	// triggers a zombie restart, debouncing transient gaps during handoffs.
@@ -906,7 +941,17 @@ func (d *Daemon) heartbeat(state *State) {
 	// 0b. Kill ghost sessions left over from stale registry (default "gt" prefix).
 	d.killDefaultPrefixGhosts()
 
-	// 0c. Reap zombie sessions (tmux alive, agent pane dead) so a failed
+	// 0c. Refinery-plane liveness gate (hq-p0aam): classify + heal dead refinery
+	// panes, including clean status-0 exits, and self-heal missing resilience
+	// wiring (remain-on-exit + pane-died hook). Extends the witness-plane fix
+	// (704e859 + 0511e79) to the refinery plane; no new mechanism. Runs before
+	// the generic zombie sweep and claims refinery sessions so they are
+	// respawned, not merely reaped.
+	if d.isPatrolActive("refinery") {
+		d.sweepRefineryLiveness()
+	}
+
+	// 0d. Reap zombie sessions (tmux alive, agent pane dead) so a failed
 	// handoff cannot leave a session that lies about its own liveness (hq-hpd1).
 	d.sweepZombieSessions()
 
@@ -1989,7 +2034,13 @@ func (d *Daemon) ensureRefineryRunning(rigName string) {
 	// hq-kt0q: the events dropbox is not the only work source — a queued merge request
 	// (gt mq submit / gt done) must also pass the gate, or ready MRs stall until a
 	// refinery session happens to be alive.
-	if !d.hasPendingEvents("refinery") && !d.hasQueuedMergeRequests(rigName) {
+	//
+	// Exception (hq-p0aam): if the liveness sweep just classified this refinery's
+	// pane as dead (silent-exit class, incl. clean status-0 exits), spawn anyway —
+	// a refinery that died on its own must be replaced even with an empty queue,
+	// or the rig silently loses its merge-queue processor until witness/deacon
+	// intervention.
+	if !d.refineryLivenessHealed(session.RefinerySessionName(session.PrefixFor(rigName))) && !d.hasPendingEvents("refinery") && !d.hasQueuedMergeRequests(rigName) {
 		// Check if session already exists before skipping — let running sessions continue
 		r := &rig.Rig{
 			Name: rigName,
@@ -2208,7 +2259,17 @@ func (d *Daemon) sweepZombieSessions() {
 	}
 	for _, rigName := range d.getKnownRigs() {
 		prefix := session.PrefixFor(rigName)
-		targets = append(targets, session.WitnessSessionName(prefix), session.RefinerySessionName(prefix))
+		witnessName := session.WitnessSessionName(prefix)
+		refineryName := session.RefinerySessionName(prefix)
+		// The refinery-plane liveness gate (hq-p0aam) owns refinery sessions it
+		// saw this heartbeat: it classifies dead panes and arranges respawns,
+		// which kill-only reaping here would break. Sessions the gate did not
+		// see (safety-stopped, patrol off) stay eligible for generic reaping.
+		if d.claimedRefineries[refineryName] {
+			targets = append(targets, witnessName)
+		} else {
+			targets = append(targets, witnessName, refineryName)
+		}
 	}
 
 	now := time.Now()
@@ -2233,6 +2294,203 @@ func (d *Daemon) sweepZombieSessions() {
 		default:
 			// Healthy or absent — drop any pending observation.
 			delete(d.zombieFirstSeen, name)
+		}
+	}
+}
+
+// refineryLivenessHealWindow is how long a classified refinery death stays
+// "recent" for the purposes of suppressing the ensureRefineryRunning event
+// gate. Several patrol cycles so the follow-up spawn is not gated out by an
+// empty queue while the classification is still valid. (var, not const:
+// tests adjust it.)
+var refineryLivenessHealWindow = 4 * time.Minute
+
+// refineryLivenessHealed reports (and consumes) whether the refinery session
+// was recently classified + healed by sweepRefineryLiveness. While true,
+// ensureRefineryRunning skips its event gate so a clean status-0 exit with an
+// empty merge queue still gets a successor. (hq-p0aam)
+func (d *Daemon) refineryLivenessHealed(sessionName string) bool {
+	if d.refineryLivenessFixes == nil {
+		return false
+	}
+	at, ok := d.refineryLivenessFixes[sessionName]
+	if !ok {
+		return false
+	}
+	if time.Since(at) > refineryLivenessHealWindow {
+		delete(d.refineryLivenessFixes, sessionName)
+		return false
+	}
+	delete(d.refineryLivenessFixes, sessionName)
+	return true
+}
+
+// sweepRefineryLiveness is the daemon refinery-plane pane_dead liveness gate
+// (hq-p0aam). The silent-exit class: a refinery agent exits cleanly (status 0,
+// e.g. the run ends after its patrol), and because the session has neither a
+// usable remain-on-exit nor a dead-pane classification, tmux destroys the
+// pane and the rig silently loses its merge-queue processor — daemon.log gets
+// ZERO respawn lines and the event-gated spawn below skips an empty queue
+// forever. The witness plane received this class of fix in 704e859 + 0511e79
+// (pane_dead-gated liveness + zombie reap + ensure* respawn); the refinery
+// plane got the liveness gate but never the classify+respawn half, because its
+// spawn is event-gated.
+//
+// Per refinery session of every known rig (safety-stopped rigs skipped):
+//
+//   - present + healthy: self-heal the resilience wiring so the NEXT death is
+//     visible to this sweep —
+//     (a) remain-on-exit ON: a clean status-0 exit then RETAINS the pane
+//     (dead=#{pane_dead}, status=#{pane_dead_status}) instead of destroying
+//     it; and
+//     (b) the crash-trace pane-died hook (gt log crash, same mechanism 0511e79
+//     installs on the refinery start path) when the session lacks any
+//     session-scoped pane-died hook. Both are idempotent; a live agent is
+//     never killed or disturbed to install them.
+//
+//   - present + dead pane (AgentDead, retained): honor the grace window
+//     (zombieGrace, shared with the hq-hpd1 sweep — a healthy handoff shows a
+//     dead pane only sub-second, a silent-exit death persists), then classify
+//     (recording the exit status: 0 = clean-exit silent class, non-zero =
+//     crash), log a visible session-death feed event, and reap the session.
+//
+//   - absent but present on the previous sweep: the original ro-66o
+//     manifestation — the pane was NOT retained (remain-on-exit off, e.g. a
+//     session started before the wiring self-heal), so there is no dead pane
+//     to classify; the session simply vanished. Mark it for respawn.
+//
+// Any classification (dead pane or vanished) sets refineryLivenessFixes,
+// which makes ensureRefineryRunning bypass the event gate for
+// refineryLivenessHealWindow so the successor is spawned even with an empty
+// merge queue. Restarts are left to ensureRefineriesRunning (single spawn
+// authority); mass-death and crash-loop guards upstream in the heartbeat still
+// apply. This sweep claims refinery sessions before sweepZombieSessions,
+// which skips refinery names it has not observed itself.
+func (d *Daemon) sweepRefineryLiveness() {
+	if d.refineryLivenessFixes == nil {
+		d.refineryLivenessFixes = make(map[string]time.Time)
+	}
+	if d.refineryPaneDeadSince == nil {
+		d.refineryPaneDeadSince = make(map[string]time.Time)
+	}
+	if d.refineryAlive == nil {
+		d.refineryAlive = make(map[string]bool)
+	}
+	safetyStop := d.refinerySafetyStopCheck
+	if safetyStop == nil {
+		safetyStop = refinery.ActiveSafetyStop
+	}
+
+	// Claim refinery names from the generic zombie sweep so a dead refinery
+	// pane is classified here (respawn) rather than reaped there (kill-only).
+	// On early return (no rigs) no refinery names were claimed; a previous
+	// heartbeat's claims must not suppress the generic sweep.
+	d.claimedRefineries = nil
+	rigs := d.getKnownRigs()
+	if len(rigs) == 0 {
+		return
+	}
+	d.claimedRefineries = make(map[string]bool, len(rigs))
+
+	now := time.Now()
+	present := make(map[string]bool, len(rigs))
+	for _, rigName := range rigs {
+		if stop, err := safetyStop(d.config.TownRoot, rigName); err != nil || stop != nil {
+			continue
+		}
+		name := session.RefinerySessionName(session.PrefixFor(rigName))
+		exists, err := d.tmux.HasSession(name)
+		if err != nil || !exists {
+			// Present on a previous sweep, gone now: the pane was not
+			// retained on exit (remain-on-exit off) and tmux destroyed it.
+			// Nothing left to classify — mark it so ensureRefineryRunning
+			// respawns it even with an empty merge queue (hq-p0aam).
+			if d.refineryAlive[name] {
+				d.logger.Printf("Refinery liveness: %s vanished since last sweep (pane not retained, silent-exit class, hq-p0aam) — marking for supervised respawn", name)
+				_ = events.LogFeed(events.TypeSessionDeath, name,
+					events.SessionDeathPayload(name, name,
+						"refinery silent-exit class: session vanished without retained pane (hq-p0aam)",
+						"daemon refinery liveness sweep"))
+				d.recordSessionDeath(name)
+				d.refineryLivenessFixes[name] = now
+			}
+			continue
+		}
+		present[name] = true
+		d.refineryAlive[name] = true
+		d.claimedRefineries[name] = true
+
+		switch d.tmux.CheckSessionHealth(name, 0) {
+		case tmux.AgentDead:
+			first, seen := d.refineryPaneDeadSince[name]
+			if !seen {
+				d.refineryPaneDeadSince[name] = now
+				d.logger.Printf("Refinery liveness: %s observed with dead agent pane — classifying; reaping if still dead after %v (hq-p0aam)", name, zombieGrace)
+				continue
+			}
+			if now.Sub(first) < zombieGrace {
+				continue
+			}
+			delete(d.refineryPaneDeadSince, name)
+			// Dead pane persisted past the handoff window: classify as the
+			// silent-exit class (incl. clean status-0 exits), log a visible
+			// session death, and convert it into a supervised respawn.
+			exitStatus, _ := d.tmux.GetPaneDeadStatus(name)
+			d.logger.Printf("Refinery liveness: %s classified DEAD (pane_dead, exit status %s, hq-p0aam) — reaping for supervised respawn", name, exitStatus)
+			_ = events.LogFeed(events.TypeSessionDeath, name,
+				events.SessionDeathPayload(name, name,
+					fmt.Sprintf("refinery silent-exit class: dead agent pane, exit status %s (hq-p0aam)", exitStatus),
+					"daemon refinery liveness sweep"))
+			if err := d.tmux.KillSessionWithProcesses(name); err != nil {
+				d.logger.Printf("Refinery liveness: error killing dead refinery %s: %v", name, err)
+				continue
+			}
+			// Intentional reap — the session is expected to be absent next
+			// sweep, not a new silent vanishing.
+			delete(d.refineryAlive, name)
+			d.recordSessionDeath(name)
+			d.refineryLivenessFixes[name] = now
+		default:
+			// Healthy: refresh the classification anchor and self-heal the
+			// resilience wiring so the NEXT death is retained and visible.
+			d.refineryPaneDeadSince[name] = now
+			// (a) remain-on-exit: aligns refinery sessions with the witness
+			// plane so dead panes are retained for classification instead of
+			// being destroyed on exit (hq-p0aam scope a).
+			if on, err := d.tmux.RemainOnExitEnabled(name); err == nil && !on {
+				if err := d.tmux.SetRemainOnExit(name, true); err != nil {
+					d.logger.Printf("Refinery liveness: failed to set remain-on-exit on %s: %v", name, err)
+				} else {
+					d.logger.Printf("Refinery liveness: %s had remain-on-exit off — set on so dead panes are retained for classification (hq-p0aam)", name)
+				}
+			}
+			// (b) crash-trace hook: only when the session has no session-
+			// scoped pane-died hook at all. Sessions started by the refinery
+			// manager (0511e79) already carry it and are left untouched —
+			// their respawn authority is this sweep, not a tmux auto-respawn
+			// hook (ensureRefineriesRunning stays the single spawn authority).
+			if configured, err := d.tmux.PaneDeadHookConfigured(name); err == nil && !configured {
+				if err := d.tmux.SetPaneDiedHook(name, "refinery/"+rigName); err != nil {
+					d.logger.Printf("Refinery liveness: failed to install crash hook on %s: %v", name, err)
+				} else {
+					d.logger.Printf("Refinery liveness: %s had no pane-died hook — crash-trace hook installed (hq-p0aam)", name)
+				}
+			}
+		}
+	}
+
+	// Drop liveness tracking for sessions that are gone. Vanish-classification
+	// above already marked the names that were alive on a previous sweep;
+	// this cleans up rigs removed from the known set and sessions this sweep
+	// itself reaped.
+	for name := range d.refineryAlive {
+		if !present[name] {
+			delete(d.refineryAlive, name)
+		}
+	}
+	for name := range d.refineryPaneDeadSince {
+		if !present[name] {
+			delete(d.refineryPaneDeadSince, name)
 		}
 	}
 }

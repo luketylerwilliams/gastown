@@ -2442,6 +2442,18 @@ func (t *Tmux) paneDead(pane string) (bool, error) {
 	return strings.TrimSpace(out) == "1", nil
 }
 
+// GetPaneDeadStatus returns the exit status of the process that killed the
+// pane (#{pane_dead_status}), or "" when the pane is alive or the query
+// fails. Used to classify silent-exit deaths: status 0 is the clean-exit
+// silent class (hq-p0aam), non-zero is a crash.
+func (t *Tmux) GetPaneDeadStatus(pane string) (string, error) {
+	out, err := t.run("display-message", "-t", pane, "-p", "#{pane_dead_status}")
+	if err != nil {
+		return "", err
+	}
+	return strings.TrimSpace(out), nil
+}
+
 // targetPaneDead reports whether the session's agent pane is dead, using the
 // same pane targeting as the liveness checks: the declared GT_PANE_ID when it
 // still resolves inside this session, otherwise the first window's pane
@@ -4655,6 +4667,56 @@ func (t *Tmux) CleanupOrphanedSessions(isGTSession func(string) bool) (cleaned i
 	}
 
 	return cleaned, nil
+}
+
+// PaneDeadHookConfigured reports whether a pane-died hook is set on the
+// session (session- or window-scoped, NOT the global hooks). Used by the
+// daemon's refinery liveness sweep to detect sessions that lost their
+// resilience wiring: a clean status-0 exit with remain-on-exit off and no
+// pane-died hook is the silent-exit class (hq-p0aam) — the pane vanishes
+// with no trace and no dead pane left for the daemon to classify.
+//
+// Scope semantics (verified against live tmux): `show-hooks -t <session>`
+// lists NOTHING for session-scoped hooks — only `show-hooks -w -t <session>`
+// shows hooks effective for the session's windows (session + window scope).
+// Global hooks are NOT included in that listing, so they never produce a
+// false positive here.
+func (t *Tmux) PaneDeadHookConfigured(session string) (bool, error) {
+	if err := validateSessionName(session); err != nil {
+		return false, err
+	}
+	out, err := t.run("show-hooks", "-w", "-t", session)
+	if err != nil {
+		return false, err
+	}
+	for _, line := range strings.Split(out, "\n") {
+		trimmed := strings.TrimSpace(line)
+		if strings.HasPrefix(trimmed, "pane-died") || strings.HasPrefix(trimmed, "pane-dead") {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
+// RemainOnExitEnabled reports whether the session has remain-on-exit
+// explicitly enabled at the session scope. When off (the default, and the
+// state checkSessionAfterCreate restores after every agent start), a clean
+// status-0 exit destroys the pane and the session — there is no dead pane
+// left for the daemon's liveness gate to classify (hq-p0aam).
+//
+// `show-options -s -t <session> remain-on-exit` prints the session-scoped
+// value only: "remain-on-exit on/off" when explicitly set, nothing when
+// unset (effective value falls back to the server default). The daemon's
+// SetRemainOnExit writes at this same scope, so this is the exact inverse.
+func (t *Tmux) RemainOnExitEnabled(session string) (bool, error) {
+	if err := validateSessionName(session); err != nil {
+		return false, err
+	}
+	out, err := t.run("show-options", "-s", "-t", session, "remain-on-exit")
+	if err != nil {
+		return false, err
+	}
+	return strings.Contains(out, "remain-on-exit on"), nil
 }
 
 // SetPaneDiedHook sets a pane-died hook on a session to detect crashes.
