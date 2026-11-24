@@ -2494,8 +2494,10 @@ func getTrackedIssues(townBeads, convoyID string) ([]trackedIssueInfo, error) {
 
 	// Build tracked dependency structs from fresh details. When fresh details
 	// are missing (cross-rig DB unreachable, missing, parked, or unroutable
-	// from town root), mark the dep with trackedStatusUnknown so callers can
-	// distinguish it from a legitimately open bead. (gt-bs6)
+	// from town root), try a direct single-bead fetch with prefix routing
+	// before falling back to trackedStatusUnknown. This handles cross-database
+	// convoys where ShowMultiple fails but bd show <id> succeeds via routing.
+	// (hq-convoy-deadlock: cross-DB beads were permanently unknown → never ready.)
 	var deps []trackedDependency
 	for _, id := range trackedIDs {
 		dep := trackedDependency{
@@ -2505,7 +2507,13 @@ func getTrackedIssues(townBeads, convoyID string) ([]trackedIssueInfo, error) {
 		if details, ok := freshDetails[id]; ok {
 			applyFreshIssueDetails(&dep, details)
 		} else {
-			dep.Status = trackedStatusUnknown
+			// Cross-DB fallback: use bd show CLI which supports prefix routing
+			// (the Go API beads.Show only queries the local DB).
+			if singleDetails := getIssueDetailsBdShow(id); singleDetails != nil {
+				applyFreshIssueDetails(&dep, singleDetails)
+			} else {
+				dep.Status = trackedStatusUnknown
+			}
 		}
 		deps = append(deps, dep)
 	}
@@ -2703,6 +2711,29 @@ func getIssueDetailsWithClient(client *beads.Beads, issueID string) *issueDetail
 		return nil
 	}
 	return issueToDetails(issue)
+}
+
+// getIssueDetailsBdShow fetches issue details via the bd CLI (not the Go API),
+// which supports prefix-based routing across rig databases. Used as a fallback
+// when the Go API can't resolve cross-database beads.
+func getIssueDetailsBdShow(issueID string) *issueDetails {
+	out, err := BdCmd("show", issueID, "--json").Stderr(io.Discard).Output()
+	if err != nil {
+		return nil
+	}
+	var issue beads.Issue
+	raw := strings.TrimSpace(string(out))
+	if strings.HasPrefix(raw, "[") {
+		var arr []beads.Issue
+		if err := json.Unmarshal(out, &arr); err == nil && len(arr) > 0 {
+			issue = arr[0]
+		} else {
+			return nil
+		}
+	} else if err := json.Unmarshal(out, &issue); err != nil {
+		return nil
+	}
+	return issueToDetails(&issue)
 }
 
 func issueToDetails(issue *beads.Issue) *issueDetails {
