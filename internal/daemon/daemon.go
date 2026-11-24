@@ -2088,7 +2088,44 @@ func (d *Daemon) ensureRefineryRunning(rigName string) {
 
 	d.metrics.recordRestart(d.ctx, "refinery")
 	telemetry.RecordDaemonRestart(d.ctx, "refinery-"+rigName)
-	d.logger.Printf("Refinery session for %s started successfully", rigName)
+	sessionName := session.RefinerySessionName(session.PrefixFor(rigName))
+	d.logRefinerySpawnOutcome(sessionName, rigName)
+}
+
+// logRefinerySpawnOutcome performs a cheap post-spawn liveness re-check for a
+// refinery session and logs the VERIFIED outcome instead of asserting success
+// blindly (hq-89smx). mgr.Start() only means the spawn command succeeded; in
+// the silent-exit class the new session can exit immediately (e.g. idle clean
+// exit), which the old unconditional "started successfully" line misled
+// observers about (see hq-p0aam kill-test: the 14:08:05Z success line was
+// followed by the session exiting idle). Observability only — this never
+// changes spawn gating semantics and never blocks beyond ~3s.
+func (d *Daemon) logRefinerySpawnOutcome(sessionName, rigName string) {
+	const checks = 3
+	const interval = 1000 * time.Millisecond
+	for i := 0; i < checks; i++ {
+		if i > 0 {
+			time.Sleep(interval)
+		}
+		if !d.tmux.IsAvailable() {
+			continue
+		}
+		switch d.tmux.CheckSessionHealth(sessionName, 0) {
+		case tmux.SessionHealthy:
+			continue
+		case tmux.SessionDead:
+			d.logger.Printf("Refinery session for %s spawned but exited (session gone, likely idle/clean exit) (hq-89smx)", rigName)
+			return
+		case tmux.AgentDead:
+			status, _ := d.tmux.GetPaneDeadStatus(sessionName + ":^")
+			d.logger.Printf("Refinery session for %s spawned but its agent pane died (exit status %s, likely idle/clean exit) (hq-89smx)", rigName, status)
+			return
+		default:
+			// AgentHung or query error: treat as alive for this check.
+			continue
+		}
+	}
+	d.logger.Printf("Refinery session for %s started successfully (liveness verified %ds after spawn) (hq-89smx)", rigName, (checks-1)*int(interval/time.Second))
 }
 
 // ensureMayorRunning ensures the Mayor is running.
