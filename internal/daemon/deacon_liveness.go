@@ -159,17 +159,24 @@ type cpuSample struct {
 // using /proc/<pid>/task/*/children. Best-effort: unreadable entries are
 // skipped, and cycles cannot occur in a process tree.
 func processDescendants(root int, maxDepth int) []int {
+	return processDescendantsFrom("/proc", root, maxDepth)
+}
+
+// processDescendantsFrom is the proc-root-parameterized core of
+// processDescendants (hq-6nyy3): tests materialize a synthetic /proc layout in
+// a temp dir to exercise the activity gate deterministically.
+func processDescendantsFrom(procRoot string, root int, maxDepth int) []int {
 	result := []int{root}
 	frontier := []int{root}
 	for depth := 0; depth < maxDepth && len(frontier) > 0; depth++ {
 		var next []int
 		for _, pid := range frontier {
-			children, err := os.ReadDir(fmt.Sprintf("/proc/%d/task", pid))
+			children, err := os.ReadDir(filepath.Join(procRoot, strconv.Itoa(pid), "task"))
 			if err != nil {
 				continue
 			}
 			for _, tid := range children {
-				data, err := os.ReadFile(fmt.Sprintf("/proc/%d/task/%s/children", pid, tid.Name()))
+				data, err := os.ReadFile(filepath.Join(procRoot, strconv.Itoa(pid), "task", tid.Name(), "children"))
 				if err != nil {
 					continue
 				}
@@ -191,7 +198,14 @@ func processDescendants(root int, maxDepth int) []int {
 // procStartTime returns the process start time from /proc/<pid>/stat field 22
 // (starttime, clock ticks since boot). Converted with boot time + USER_HZ.
 func procStartTime(pid int) (time.Time, error) {
-	data, err := os.ReadFile(filepath.Join("/proc", strconv.Itoa(pid), "stat"))
+	return procStartTimeFrom("/proc", pid)
+}
+
+// procStartTimeFrom is the proc-root-parameterized core of procStartTime
+// (hq-6nyy3 test seam). Boot time is only consulted for the real /proc; a
+// synthetic tree uses relative tick arithmetic against an epoch-zero boot.
+func procStartTimeFrom(procRoot string, pid int) (time.Time, error) {
+	data, err := os.ReadFile(filepath.Join(procRoot, strconv.Itoa(pid), "stat"))
 	if err != nil {
 		return time.Time{}, err
 	}
@@ -202,12 +216,14 @@ func procStartTime(pid int) (time.Time, error) {
 		return time.Time{}, fmt.Errorf("malformed stat for pid %d", pid)
 	}
 	fields := strings.Fields(stat[idx+2:])
-	// starttime is field 22 overall; after removing fields 1-2 it is index 19.
-	const starttimeIdx = 19
-	if len(fields) <= starttimeIdx {
+	// starttime is overall field 22; after fields 1-2 there are 20 remaining
+	// fields (state at index 0 ... starttime at index 19), so a valid stat has
+	// exactly len(fields) == 20.
+	const numFieldsAfterComm = 20
+	if len(fields) < numFieldsAfterComm {
 		return time.Time{}, fmt.Errorf("short stat for pid %d", pid)
 	}
-	ticks, err := strconv.ParseUint(fields[starttimeIdx], 10, 64)
+	ticks, err := strconv.ParseUint(fields[numFieldsAfterComm-1], 10, 64)
 	if err != nil {
 		return time.Time{}, err
 	}
@@ -226,7 +242,13 @@ func procStartTime(pid int) (time.Time, error) {
 // apart whose sum grew show work in flight even when nothing was spawned
 // recently.
 func procCPUTime(pid int) (total int64, err error) {
-	data, err := os.ReadFile(filepath.Join("/proc", strconv.Itoa(pid), "stat"))
+	return procCPUTimeFrom("/proc", pid)
+}
+
+// procCPUTimeFrom is the proc-root-parameterized core of procCPUTime
+// (hq-6nyy3 test seam).
+func procCPUTimeFrom(procRoot string, pid int) (total int64, err error) {
+	data, err := os.ReadFile(filepath.Join(procRoot, strconv.Itoa(pid), "stat"))
 	if err != nil {
 		return 0, err
 	}
