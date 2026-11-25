@@ -7,15 +7,24 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 )
 
 // deaconProcessActivityGrace is how recently a descendant opencode process of
-// the deacon's tmux pane must have been spawned for the pane subtree to count
-// as live activity (hq-is5lo). Tool spawns happen every few seconds during an
-// active turn; a quiet subtree for this long with a stale heartbeat and a
-// static pane is the genuine stuck signature.
+// the deacon's tmux pane must have been spawned — or how recently a live
+// descendant must have accumulated CPU time — for the pane subtree to count
+// as live activity (hq-is5lo, extended by hq-6nyy3). Tool spawns happen every
+// few seconds during an active turn; a quiet subtree for this long with a
+// stale heartbeat and a static pane is the genuine stuck signature.
 const deaconProcessActivityGrace = 5 * time.Minute
+
+// deaconCPUActivityDelta is the minimum utime+stime growth (in clock ticks) a
+// live descendant must show between two daemon activity checks to count as
+// work in flight (hq-6nyy3). 100 ticks = 1 CPU-second at the usual USER_HZ=100
+// — far more than daemon polling overhead, far less than an active
+// go test/git/npm compile or a busy node runtime produces.
+const deaconCPUActivityDelta int64 = 100
 
 // deaconStartupHBWindow bounds the daemon startup-heartbeat race fix: a
 // heartbeat written within this window AFTER the daemon recorded the deacon
@@ -70,13 +79,17 @@ func (d *Daemon) deaconSubtreeHasRecentActivity(sessionName string) bool {
 
 	cutoff := time.Now().Add(-deaconProcessActivityGrace)
 	descendants := processDescendants(panePID, 4)
+	// hq-6nyy3: a monotonic probe sequence id lets procCPUTimeSamples dedupe
+	// per-pid samples when a pid legitimately appears multiple times in the
+	// subtree walk (multiple task/*/children entries listing the same child).
+	probeID := atomic.AddUint64(&d.deaconActivityProbe, 1)
 	for _, pid := range descendants {
 		cmd, err := os.ReadFile(filepath.Join("/proc", strconv.Itoa(pid), "comm"))
 		if err != nil {
 			continue
 		}
 		name := strings.TrimSpace(string(cmd))
-		if name != "opencode" && name != "claude" && name != "node" {
+		if !isDeaconActivityComm(name) {
 			continue
 		}
 		started, err := procStartTime(pid)
@@ -86,8 +99,60 @@ func (d *Daemon) deaconSubtreeHasRecentActivity(sessionName string) bool {
 		if started.After(cutoff) {
 			return true
 		}
+		// hq-6nyy3 blind-spot fix (a): long-running tool children (bash -c,
+		// go test, git, npm, python...) spawned BEFORE the grace window are
+		// invisible to the fresh-spawn check above. A deacon mid a 10-minute
+		// `go test ./...` has a stale opencode ancestor and excluded bash
+		// grandchildren — the gate read false while the deacon was working.
+		// Live CPU-time accumulation closes this: compare the descendant's
+		// utime+stime against the sample from the previous check; growth of
+		// at least deaconCPUActivityDelta ticks means it is burning CPU NOW.
+		total, err := procCPUTime(pid)
+		if err != nil {
+			continue
+		}
+		if total >= deaconCPUActivityDelta {
+			if d.deaconActivityCPU == nil {
+				d.deaconActivityCPU = map[int]cpuSample{}
+			}
+			d.deaconActivityMu.Lock()
+			prev, seen := d.deaconActivityCPU[pid]
+			d.deaconActivityCPU[pid] = cpuSample{probe: probeID, total: total}
+			d.deaconActivityMu.Unlock()
+			if seen && prev.probe != probeID && total-prev.total >= deaconCPUActivityDelta {
+				d.logger.Printf("Activity check: pid %d (%s) gained %d CPU ticks since last check — work in flight",
+					pid, name, total-prev.total)
+				return true
+			}
+		}
 	}
 	return false
+}
+
+// isDeaconActivityComm reports whether a process command name is part of the
+// deacon's expected execution subtree (agent runtimes and the tool processes
+// they spawn, hq-6nyy3). Matches /proc/<pid>/comm, which is truncated to 15
+// characters, so prefix forms like "opencode serv" or "node:999999" variants
+// are tolerated where safe.
+func isDeaconActivityComm(name string) bool {
+	switch name {
+	case "opencode", "claude", "node", "bash", "sh", "git", "go", "npm", "npx",
+		"python", "python3", "rg", "grep", "jq", "gt", "bd", "tmux", "sleep":
+		return true
+	}
+	// Compiled Go test binaries are named <pkg>.test; toolchains spawn
+	// compile/link children (compile, link, cgo).
+	if strings.HasSuffix(name, ".test") || name == "compile" || name == "link" || name == "cgo" {
+		return true
+	}
+	return false
+}
+
+// cpuSample records the cumulative CPU time of a pid as observed by one
+// activity probe (a single deaconSubtreeHasRecentActivity call).
+type cpuSample struct {
+	probe uint64
+	total int64
 }
 
 // processDescendants returns pids reachable from root within maxDepth levels
@@ -153,6 +218,39 @@ func procStartTime(pid int) (time.Time, error) {
 	hz := userHZ()
 	age := time.Duration(ticks) * time.Second / time.Duration(hz)
 	return boot.Add(age), nil
+}
+
+// procCPUTime returns a process's cumulative CPU time in clock ticks —
+// utime+stime from /proc/<pid>/stat fields 14 and 15. Used by the hq-6nyy3
+// CPU-delta activity signal: two samples of a live pid taken a daemon tick
+// apart whose sum grew show work in flight even when nothing was spawned
+// recently.
+func procCPUTime(pid int) (total int64, err error) {
+	data, err := os.ReadFile(filepath.Join("/proc", strconv.Itoa(pid), "stat"))
+	if err != nil {
+		return 0, err
+	}
+	stat := string(data)
+	idx := strings.LastIndex(stat, ")")
+	if idx < 0 || idx+2 >= len(stat) {
+		return 0, fmt.Errorf("malformed stat for pid %d", pid)
+	}
+	fields := strings.Fields(stat[idx+2:])
+	// Field 2 (comm) is consumed up to the closing paren, so overall field 14
+	// (utime) is index 11 and field 15 (stime) is index 12 here.
+	const utimeIdx, stimeIdx = 11, 12
+	if len(fields) <= stimeIdx {
+		return 0, fmt.Errorf("short stat for pid %d", pid)
+	}
+	ut, err := strconv.ParseInt(fields[utimeIdx], 10, 64)
+	if err != nil {
+		return 0, err
+	}
+	st, err := strconv.ParseInt(fields[stimeIdx], 10, 64)
+	if err != nil {
+		return 0, err
+	}
+	return ut + st, nil
 }
 
 // bootTime reads btime from /proc/stat.

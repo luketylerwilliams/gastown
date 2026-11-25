@@ -88,6 +88,16 @@ type Daemon struct {
 	deaconBusyHash   string
 	deaconBusyChecks int
 
+	// hq-6nyy3 CPU-delta activity state: deaconActivityCPU holds the last
+	// observed cumulative CPU time per pid from the previous activity probe,
+	// and deaconActivityProbe numbers the probes so per-pid samples are only
+	// compared across checks, never within one. Written only from the
+	// heartbeat loop goroutine; the mutex guards the unit-test seam where
+	// probes can run concurrently.
+	deaconActivityMu    sync.Mutex
+	deaconActivityCPU   map[int]cpuSample
+	deaconActivityProbe uint64
+
 	// syncFailures tracks consecutive git pull failures per workdir.
 	// Used to escalate logging from WARN to ERROR after repeated failures.
 	// Only accessed from heartbeat loop goroutine - no sync needed.
