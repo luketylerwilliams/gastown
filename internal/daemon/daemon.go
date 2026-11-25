@@ -60,9 +60,20 @@ type Daemon struct {
 	cancel        context.CancelFunc
 	curator       *feed.Curator
 	convoyManager *ConvoyManager
+	// beadsStores holds the convoy beads stores. Guarded by beadsStoresMu
+	// only for writes that happen after startup (hq-c6ra8 reopen path); the
+	// startup assignment and shutdown nil-out are single-threaded.
 	beadsStores   map[string]beadsdk.Storage
-	doltServer    *DoltServerManager
-	krcPruner     *KRCPruner
+	beadsStoresMu sync.Mutex
+
+	// Convoy beads-store reopen backoff state (hq-c6ra8). Written only from
+	// the convoy event-poll goroutine via the storeOpener callback.
+	storeReopenAttempts     int
+	storeReopenBackoff      time.Duration
+	storeReopenFirstAttempt time.Time
+	storeReopenNextAttempt  time.Time
+	doltServer              *DoltServerManager
+	krcPruner               *KRCPruner
 
 	// disabledPatrols is loaded from town settings (disabled_patrols field).
 	// Provides a simple way to disable individual patrol dogs without editing
@@ -578,8 +589,14 @@ func (d *Daemon) Run() (err error) {
 	}
 
 	// Start convoy manager (event-driven + periodic stranded scan)
-	// Try opening beads stores eagerly; if Dolt isn't ready yet,
-	// pass the opener as a callback for lazy retry on each poll tick.
+	// Try opening beads stores eagerly; if Dolt isn't ready yet, pass the
+	// opener as a callback for lazy retry on each poll tick.
+	//
+	// hq-c6ra8: the eager open can fail entirely when the daemon and Dolt
+	// start in the same second. The manager re-arms the opener whenever its
+	// store set loses the hq store, so event lookups recover without a manual
+	// daemon restart. The opener self-throttles with bounded exponential
+	// backoff.
 	d.beadsStores, err = d.openBeadsStores()
 	if err != nil {
 		return err
@@ -593,16 +610,54 @@ func (d *Daemon) Run() (err error) {
 		ok, _ := d.isRigOperational(rigName)
 		return !ok
 	}
-	var storeOpener func() map[string]beadsdk.Storage
-	if len(d.beadsStores) == 0 {
-		storeOpener = func() map[string]beadsdk.Storage {
-			stores, err := d.openBeadsStores()
-			if err != nil {
-				d.logger.Printf("Convoy: beads compatibility check failed: %v", err)
+	storeOpener := func() map[string]beadsdk.Storage {
+		// Retry with bounded exponential backoff until Dolt becomes
+		// reachable. Once stores reopen, the per-cycle "store unavailable,
+		// skipping" log spam stops because the hq store is present again.
+		if time.Now().Before(d.storeReopenNextAttempt) {
+			return nil
+		}
+		stores, err := d.openBeadsStores()
+		if err != nil {
+			d.logger.Printf("Convoy: beads compatibility check failed: %v", err)
+			stores = nil
+		}
+		if len(stores) == 0 {
+			if d.storeReopenFirstAttempt.IsZero() {
+				d.storeReopenFirstAttempt = time.Now()
+			}
+			d.storeReopenAttempts++
+			if time.Now().After(d.storeReopenFirstAttempt.Add(storeReopenGiveUpAfter)) {
+				d.logger.Printf("Convoy: beads store re-open giving up after %d attempts (Dolt unreachable for %s); event polling stays disabled until daemon restart",
+					d.storeReopenAttempts, time.Since(d.storeReopenFirstAttempt).Truncate(time.Second))
 				return nil
 			}
-			return stores
+			delay := d.storeReopenBackoff
+			// Bounded exponential backoff: 5s → 10s → 20s ... capped at 60s.
+			if d.storeReopenBackoff < storeReopenMaxBackoff {
+				d.storeReopenBackoff *= 2
+				if d.storeReopenBackoff > storeReopenMaxBackoff {
+					d.storeReopenBackoff = storeReopenMaxBackoff
+				}
+			}
+			d.storeReopenNextAttempt = time.Now().Add(delay)
+			return nil
 		}
+		// Success: reset backoff state and report recovery duration.
+		elapsed := time.Duration(0)
+		retries := d.storeReopenAttempts
+		if !d.storeReopenFirstAttempt.IsZero() {
+			elapsed = time.Since(d.storeReopenFirstAttempt).Truncate(time.Second)
+		}
+		if retries > 0 {
+			d.logger.Printf("Convoy: re-opened %d beads store(s) after %s (%d retry attempts)", len(stores), elapsed, retries)
+		}
+		d.storeReopenAttempts = 0
+		d.storeReopenBackoff = storeReopenBaseBackoff
+		d.storeReopenFirstAttempt = time.Time{}
+		d.storeReopenNextAttempt = time.Time{}
+		d.setBeadsStores(stores)
+		return stores
 	}
 	d.convoyManager = NewConvoyManager(d.config.TownRoot, d.logger.Printf, d.gtPath, 0, d.beadsStores, storeOpener, isRigParked)
 	if err := d.convoyManager.Start(); err != nil {
@@ -1470,7 +1525,14 @@ func (d *Daemon) ensureBootRunning() {
 // Returns true conservatively on error or when no stores are available, so the
 // caller falls through to spawn Boot rather than suppressing it incorrectly.
 func (d *Daemon) hasActiveWork() bool {
-	if len(d.beadsStores) == 0 {
+	d.beadsStoresMu.Lock()
+	stores := make(map[string]beadsdk.Storage, len(d.beadsStores))
+	for k, v := range d.beadsStores {
+		stores[k] = v
+	}
+	d.beadsStoresMu.Unlock()
+
+	if len(stores) == 0 {
 		// No stores open — cannot inspect; let Boot run to be safe.
 		return true
 	}
@@ -1478,7 +1540,7 @@ func (d *Daemon) hasActiveWork() bool {
 	ctx, cancel := context.WithTimeout(d.ctx, 5*time.Second)
 	defer cancel()
 
-	for name, store := range d.beadsStores {
+	for name, store := range stores {
 		for _, rawStatus := range []string{"in_progress"} {
 			s := beadsdk.Status(rawStatus)
 			filter := beadsdk.IssueFilter{Status: &s, Limit: 1}
@@ -2650,17 +2712,29 @@ func (d *Daemon) killDefaultPrefixGhosts() {
 
 // openBeadsStores opens beads stores for the town (hq) and all known rigs.
 // Returns a map keyed by "hq" for town-level and rig names for per-rig stores.
-// Stores that fail to open are logged and skipped. Successfully opened stores
-// are compatibility-checked before being returned to Convoy polling.
+// Successfully opened stores are compatibility-checked before being returned
+// to Convoy polling.
+//
+// Partial availability is tolerated: when Dolt is still booting (the daemon
+// and the SQL server can come up in the same second — hq-c6ra8), individual
+// opens fail. Per-store failures are counted and summarized in a single log
+// line instead of one line per store so a full outage produces one log line
+// per attempt, not 27. The caller (the convoy manager's event-poll ticker)
+// retries the attempt until enough stores become available.
 func (d *Daemon) openBeadsStores() (map[string]beadsdk.Storage, error) {
 	stores := make(map[string]beadsdk.Storage)
+	failed := 0
+	var firstFailure string
 
 	// Town-level store (hq)
 	hqBeadsDir := filepath.Join(d.config.TownRoot, ".beads")
 	if store, err := beadsdk.OpenFromConfig(d.ctx, hqBeadsDir); err == nil {
 		stores["hq"] = store
 	} else {
-		d.logger.Printf("Convoy: hq beads store unavailable: %s", util.FirstLine(err.Error()))
+		failed++
+		if firstFailure == "" {
+			firstFailure = "hq: " + util.FirstLine(err.Error())
+		}
 	}
 
 	// Per-rig stores
@@ -2671,14 +2745,21 @@ func (d *Daemon) openBeadsStores() (map[string]beadsdk.Storage, error) {
 		}
 		store, err := beadsdk.OpenFromConfig(d.ctx, beadsDir)
 		if err != nil {
-			d.logger.Printf("Convoy: %s beads store unavailable: %s", rigName, util.FirstLine(err.Error()))
+			failed++
+			if firstFailure == "" {
+				firstFailure = rigName + ": " + util.FirstLine(err.Error())
+			}
 			continue
 		}
 		stores[rigName] = store
 	}
 
 	if len(stores) == 0 {
-		d.logger.Printf("Convoy: no beads stores available, event polling disabled")
+		if failed > 0 {
+			d.logger.Printf("Convoy: no beads stores available (%d failed, event polling retry scheduled); first failure: %s", failed, firstFailure)
+		} else {
+			d.logger.Printf("Convoy: no beads stores available, event polling disabled")
+		}
 		return nil, nil
 	}
 
@@ -2691,8 +2772,25 @@ func (d *Daemon) openBeadsStores() (map[string]beadsdk.Storage, error) {
 	for name := range stores {
 		names = append(names, name)
 	}
-	d.logger.Printf("Convoy: opened %d beads store(s): %v", len(stores), names)
+	if failed > 0 {
+		d.logger.Printf("Convoy: opened %d beads store(s) (%d still unavailable): %v", len(stores), failed, names)
+	} else {
+		d.logger.Printf("Convoy: opened %d beads store(s): %v", len(stores), names)
+	}
 	return stores, nil
+}
+
+// setBeadsStores replaces the daemon's convoy beads stores and keeps the
+// convoy manager's snapshot in sync (called from the store-reopen path which
+// runs on the convoy event-poll goroutine).
+func (d *Daemon) setBeadsStores(stores map[string]beadsdk.Storage) {
+	d.beadsStoresMu.Lock()
+	d.beadsStores = stores
+	mgr := d.convoyManager
+	d.beadsStoresMu.Unlock()
+	if mgr != nil {
+		mgr.SetStores(stores)
+	}
 }
 
 // getKnownRigs returns list of registered rig names.
@@ -2861,7 +2959,9 @@ func (d *Daemon) shutdown(state *State) error { //nolint:unparam // error return
 		d.convoyManager.Stop()
 		d.logger.Println("Convoy manager stopped")
 	}
+	d.beadsStoresMu.Lock()
 	d.beadsStores = nil
+	d.beadsStoresMu.Unlock()
 
 	// Stop KRC pruner
 	if d.krcPruner != nil {

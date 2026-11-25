@@ -2370,6 +2370,230 @@ func TestDoltRecoveryCallback_NilSafe(t *testing.T) {
 	dsm.mu.Unlock()
 }
 
+// convoyEventStore is a minimal Storage stub that serves events and records
+// convoy queries. Unimplemented methods panic via the embedded interface.
+type convoyEventStore struct {
+	beadsdk.Storage
+	mu      sync.Mutex
+	events  []*beadsdk.Event
+	queried int32
+}
+
+func (s *convoyEventStore) GetAllEventsSince(_ context.Context, since time.Time) ([]*beadsdk.Event, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	var out []*beadsdk.Event
+	for _, e := range s.events {
+		if e.CreatedAt.After(since) || e.CreatedAt.Equal(since) {
+			out = append(out, e)
+		}
+	}
+	return out, nil
+}
+
+// GetDependentsWithMetadata stands in for the convoy-tracks lookup performed
+// after a close is detected.
+func (s *convoyEventStore) GetDependentsWithMetadata(_ context.Context, _ string) ([]*beadsdk.IssueWithDependencyMetadata, error) {
+	atomic.AddInt32(&s.queried, 1)
+	return nil, nil
+}
+
+func (s *convoyEventStore) addClose(id, issueID string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.events = append(s.events, &beadsdk.Event{
+		ID:        id,
+		IssueID:   issueID,
+		EventType: beadsdk.EventStatusChanged,
+		OldValue:  strPtr("in_progress"),
+		NewValue:  strPtr("closed"),
+		CreatedAt: time.Now().UTC(),
+	})
+}
+
+func strPtr(s string) *string { return &s }
+
+// TestRunEventPoll_ReopensStoresAfterStartupRace is the hq-c6ra8 regression
+// test: when every beads store open fails at daemon startup (Dolt not yet
+// listening) and the hq store becomes available later, the convoy manager
+// must recover event polling WITHOUT a process restart.
+//
+// Timeline simulated (with sped-up intervals):
+//  1. Manager starts with nil stores; opener returns nil (Dolt down).
+//  2. Opener starts returning an hq store after a few attempts.
+//  3. A close event arrives on the reopened store.
+//  4. Verify the manager re-armed polling, took the store set, and ran a
+//     convoy lookup for the close (proving lookups are functional again).
+func TestRunEventPoll_ReopensStoresAfterStartupRace(t *testing.T) {
+	var attempts int32
+	var logged []string
+	var logMu sync.Mutex
+	logger := func(format string, args ...interface{}) {
+		logMu.Lock()
+		defer logMu.Unlock()
+		logged = append(logged, fmt.Sprintf(format, args...))
+	}
+
+	hq := &convoyEventStore{}
+
+	// Opener mimics the daemon-side schedule: fail for the first 3 calls
+	// (connection refused), then succeed with the hq store.
+	opener := func() map[string]beadsdk.Storage {
+		n := atomic.AddInt32(&attempts, 1)
+		if n < 3 {
+			return nil
+		}
+		return map[string]beadsdk.Storage{"hq": hq}
+	}
+
+	m := NewConvoyManager(t.TempDir(), logger, "gt", time.Hour, nil, opener, nil)
+	m.pollTick = 10 * time.Millisecond
+
+	// Drive the tick body synchronously through the same helper runEventPoll
+	// uses, so the reopen retry schedule, store adoption, and event
+	// processing are all exercised deterministically (a live goroutine with a
+	// 10ms ticker is flaky on loaded CI).
+	deadline := time.After(5 * time.Second)
+	hadStores := false
+	for !hadStores {
+		select {
+		case <-deadline:
+			t.Fatalf("hq store was never re-opened; opener attempts=%d logs=%v", atomic.LoadInt32(&attempts), logged)
+		default:
+		}
+		hadStores, _ = m.eventPollTick()
+	}
+
+	// Wait until the manager has adopted the reopened store.
+	for {
+		m.storesMu.Lock()
+		usable := m.stores["hq"] != nil
+		m.storesMu.Unlock()
+		if usable {
+			break
+		}
+		select {
+		case <-deadline:
+			t.Fatalf("hq store was never re-opened; opener attempts=%d logs=%v", atomic.LoadInt32(&attempts), logged)
+		case <-time.After(10 * time.Millisecond):
+		}
+	}
+
+	if atomic.LoadInt32(&attempts) < 3 {
+		t.Fatalf("expected >=3 opener attempts before success, got %d", attempts)
+	}
+
+	// The reopen tick above was the warm-up cycle (advances HWMs only). Now
+	// inject a close event and poll again — it must be processed, proving
+	// convoy lookups are functional again post-reopen.
+	hq.addClose("evt-1", "hq-done1")
+
+	var polledOnce bool
+	for i := 0; i < 100 && !polledOnce; i++ {
+		polled, _ := m.eventPollTick()
+		if !polled {
+			t.Fatal("stores became unusable after recovery")
+		}
+		logMu.Lock()
+		for _, s := range logged {
+			if strings.Contains(s, "close detected: hq-done1") {
+				polledOnce = true
+			}
+		}
+		logMu.Unlock()
+	}
+	if !polledOnce {
+		t.Fatalf("close event was never processed after store recovery logs=%v", logged)
+	}
+	if atomic.LoadInt32(&hq.queried) == 0 {
+		t.Error("expected the recovered hq store to receive convoy lookup queries")
+	}
+
+	// And the stores-recovered log line must have been emitted.
+	logMu.Lock()
+	defer logMu.Unlock()
+	found := false
+	for _, s := range logged {
+		if strings.Contains(s, "beads stores recovered") {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("expected 'beads stores recovered' log, got: %v", logged)
+	}
+}
+
+// TestStoresUsableLocked covers the hq-presence gate used by the reopen loop.
+func TestStoresUsableLocked(t *testing.T) {
+	stub := &convoyEventStore{}
+	cases := []struct {
+		name   string
+		stores map[string]beadsdk.Storage
+		want   bool
+	}{
+		{"nil stores", nil, false},
+		{"empty stores", map[string]beadsdk.Storage{}, false},
+		{"rig stores only (hq missing — c6ra8 partial-failure state)", map[string]beadsdk.Storage{"riga": stub}, false},
+		{"hq only", map[string]beadsdk.Storage{"hq": stub}, true},
+		{"hq + rig", map[string]beadsdk.Storage{"hq": stub, "riga": stub}, true},
+		{"nil hq value", map[string]beadsdk.Storage{"hq": nil}, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			m := &ConvoyManager{stores: tc.stores}
+			if got := m.storesUsableLocked(); got != tc.want {
+				t.Errorf("storesUsableLocked() = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
+// TestPollStore_MissingHQ_NoLookupSpamWithoutOpener verifies the degraded
+// lookup path: with no hq store and no opener, pollStore skips lookups with
+// the explicit "no re-open path" message (not the old bare-spam message).
+func TestPollStore_MissingHQ_LogsAwaitingReopen(t *testing.T) {
+	rig := &convoyEventStore{}
+	rig.addClose("evt-1", "hq-x1")
+	rig.addClose("evt-2", "hq-x2")
+
+	var logged []string
+	logger := func(format string, args ...interface{}) {
+		logged = append(logged, fmt.Sprintf(format, args...))
+	}
+	m := NewConvoyManager(t.TempDir(), logger, "gt", time.Hour, map[string]beadsdk.Storage{"rig": rig}, func() map[string]beadsdk.Storage { return nil }, nil)
+	m.seeded.Store(true)
+
+	seen := map[string]bool{}
+	if err := m.pollStore("rig", rig, map[string]beadsdk.Storage{"rig": rig}, seen); err != nil {
+		t.Fatalf("pollStore: %v", err)
+	}
+	joined := strings.Join(logged, "\n")
+	if !strings.Contains(joined, "awaiting re-open") {
+		t.Errorf("expected 'awaiting re-open' degraded-lookup log, got: %v", logged)
+	}
+	if strings.Contains(joined, "no re-open path") {
+		t.Errorf("opener exists, so 'no re-open path' must not be logged: %v", logged)
+	}
+}
+
+// TestPollStore_NoOpenerNoHQ covers the no-opener variant of the same branch.
+func TestPollStore_NoOpenerNoHQ(t *testing.T) {
+	rig := &convoyEventStore{}
+	var logged []string
+	logger := func(format string, args ...interface{}) {
+		logged = append(logged, fmt.Sprintf(format, args...))
+	}
+	m := NewConvoyManager(t.TempDir(), logger, "gt", time.Hour, map[string]beadsdk.Storage{"rig": rig}, nil, nil)
+	m.seeded.Store(true)
+
+	if err := m.pollStore("rig", rig, map[string]beadsdk.Storage{"rig": rig}, map[string]bool{}); err != nil {
+		t.Fatalf("pollStore: %v", err)
+	}
+	if !strings.Contains(strings.Join(logged, "\n"), "no re-open path") {
+		t.Errorf("expected 'no re-open path' log, got: %v", logged)
+	}
+}
+
 // infNaNStorage is a minimal Storage stub whose GetAllEventsSince always
 // returns the given error. All other methods panic (they should not be called).
 type infNaNStorage struct {

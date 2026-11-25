@@ -30,6 +30,15 @@ const (
 	// auto-close. This prevents a race where the daemon's stranded scan
 	// fires before the sling's bd dep add is visible in Dolt. See GH#2303.
 	convoyGracePeriod = 5 * time.Minute
+
+	// storeReopen* control the convoy beads-store reopen retry schedule
+	// (hq-c6ra8). When every store open fails at daemon startup because Dolt
+	// is not yet listening, the convoy manager keeps re-invoking its store
+	// opener with bounded exponential backoff (5s doubling to a 60s cap)
+	// until stores become available, or until the give-up horizon passes.
+	storeReopenBaseBackoff = 5 * time.Second
+	storeReopenMaxBackoff  = 60 * time.Second
+	storeReopenGiveUpAfter = 30 * time.Minute
 )
 
 // strandedConvoyInfo matches the JSON output of `gt convoy stranded --json`.
@@ -53,10 +62,14 @@ type strandedConvoyInfo struct {
 type ConvoyManager struct {
 	townRoot     string
 	scanInterval time.Duration
-	ctx          context.Context
-	cancel       context.CancelFunc
-	wg           sync.WaitGroup
-	logger       func(format string, args ...interface{})
+
+	// pollTick overrides the event-poll tick when > 0 (tests; hq-c6ra8
+	// regression coverage). Production leaves it zero -> eventPollInterval.
+	pollTick time.Duration
+	ctx      context.Context
+	cancel   context.CancelFunc
+	wg       sync.WaitGroup
+	logger   func(format string, args ...interface{})
 
 	// stores maps store names to beads stores for event polling.
 	// Key "hq" is the town-level store (used for convoy lookups).
@@ -119,7 +132,8 @@ type ConvoyManager struct {
 // stores maps store names ("hq", rig names) to beads stores for event polling.
 // nil stores disables event-driven convoy checks (stranded scan still runs),
 // unless openStores is provided for lazy initialization.
-// openStores is called lazily if stores is nil (e.g., Dolt not ready at startup).
+// openStores is called whenever the store set lacks the hq store (e.g., Dolt
+// not ready at startup — hq-c6ra8); it stays armed for the manager's lifetime.
 // isRigParked reports whether a rig should be skipped during polling (nil = never parked).
 // gtPath is the resolved path to the gt binary for subprocess calls.
 func NewConvoyManager(townRoot string, logger func(format string, args ...interface{}), gtPath string, scanInterval time.Duration, stores map[string]beadsdk.Storage, openStores func() map[string]beadsdk.Storage, isRigParked func(string) bool) *ConvoyManager {
@@ -180,23 +194,49 @@ func (m *ConvoyManager) Stop() {
 	}
 }
 
+// storesUsableLocked reports whether the manager's store set can support
+// convoy lookups: at least one store and the town-level "hq" store present
+// (convoys live in hq). Callers must hold storesMu.
+func (m *ConvoyManager) storesUsableLocked() bool {
+	return len(m.stores) > 0 && m.stores["hq"] != nil
+}
+
+// SetStores replaces the manager's store set (used by the daemon when beads
+// stores are re-opened after a startup failure — hq-c6ra8). Closing of any
+// previously-held stores is the caller's responsibility; this only swaps the
+// map so in-flight poll snapshots are unaffected.
+func (m *ConvoyManager) SetStores(stores map[string]beadsdk.Storage) {
+	m.storesMu.Lock()
+	defer m.storesMu.Unlock()
+	m.stores = stores
+}
+
 // runEventPoll polls GetAllEventsSince every 5s and processes close events.
 // If stores aren't available at startup (e.g., Dolt not ready), retries
-// lazily via the openStores callback until stores become available.
+// lazily via the openStores callback until the hq store becomes available.
+// The retry stays armed for the manager's lifetime (hq-c6ra8): if the hq
+// store is missing while rig stores are present (all opens failed during the
+// Dolt startup race), the lookup path would otherwise log
+// "store unavailable, skipping" every cycle forever. The opener
+// self-throttles, so checking each tick is cheap.
 func (m *ConvoyManager) runEventPoll() {
 	defer m.wg.Done()
 
 	m.storesMu.Lock()
-	hasStores := len(m.stores) > 0
-	hasOpener := m.openStores != nil
+	canPoll := len(m.stores) > 0 || m.openStores != nil
 	m.storesMu.Unlock()
 
-	if !hasStores && !hasOpener {
+	if !canPoll {
 		m.logger("Convoy: no beads stores and no opener, event polling disabled")
 		return
 	}
 
+	// scanInterval doubles as the configurable event-poll tick for tests
+	// (hq-c6ra8 regression coverage); 0 or negative keeps the 5s default.
 	currentInterval := eventPollInterval
+	if m.pollTick > 0 {
+		currentInterval = m.pollTick
+	}
 	ticker := time.NewTicker(currentInterval)
 	defer ticker.Stop()
 
@@ -205,26 +245,10 @@ func (m *ConvoyManager) runEventPoll() {
 		case <-m.ctx.Done():
 			return
 		case <-ticker.C:
-			m.storesMu.Lock()
-			// Lazy store initialization: retry if stores not yet available
-			if len(m.stores) == 0 {
-				if m.openStores != nil {
-					m.stores = m.openStores()
-				}
-				if len(m.stores) == 0 {
-					m.storesMu.Unlock()
-					continue // still not ready, try next tick
-				}
+			polled, hadError := m.eventPollTick()
+			if !polled {
+				continue // stores not usable this tick
 			}
-			// Take a snapshot of stores for this tick to avoid holding the
-			// lock across potentially slow network/Dolt calls.
-			snapshot := make(map[string]beadsdk.Storage, len(m.stores))
-			for k, v := range m.stores {
-				snapshot[k] = v
-			}
-			m.storesMu.Unlock()
-
-			hadError := m.pollStoresSnapshot(snapshot)
 			// Exponential backoff on consecutive errors to avoid hammering
 			// a recovering Dolt server. Reset on success. (GH#2686)
 			if hadError {
@@ -244,6 +268,41 @@ func (m *ConvoyManager) runEventPoll() {
 			}
 		}
 	}
+}
+
+// eventPollTick runs one convoy event-poll cycle: it re-opens beads stores
+// when the hq store is missing (hq-c6ra8 recovery), then snapshots the store
+// set and polls it. Returns polled=false when no usable stores were
+// available this tick (reopen still pending), and hadError from the poll when
+// stores were polled.
+//
+// The reopen retry stays armed for the manager's lifetime: the opener
+// self-throttles with bounded backoff, so checking each tick is cheap.
+func (m *ConvoyManager) eventPollTick() (polled bool, hadError bool) {
+	m.storesMu.Lock()
+	if !m.storesUsableLocked() {
+		if m.openStores != nil {
+			if opened := m.openStores(); len(opened) > 0 {
+				// The opener may call SetStores itself; prefer its return
+				// value so this tick can poll immediately.
+				m.stores = opened
+			}
+		}
+		if !m.storesUsableLocked() {
+			m.storesMu.Unlock()
+			return false, false // still not ready, try next tick
+		}
+		m.logger("Convoy: beads stores recovered, event polling active")
+	}
+	// Take a snapshot of stores for this tick to avoid holding the lock
+	// across potentially slow network/Dolt calls.
+	snapshot := make(map[string]beadsdk.Storage, len(m.stores))
+	for k, v := range m.stores {
+		snapshot[k] = v
+	}
+	m.storesMu.Unlock()
+
+	return true, m.pollStoresSnapshot(snapshot)
 }
 
 // pollStoresSnapshot polls events from all non-parked stores in the snapshot.
@@ -335,7 +394,14 @@ func (m *ConvoyManager) pollStore(name string, store beadsdk.Storage, stores map
 	// Use hq store for convoy lookups (convoys are hq-* prefixed)
 	hqStore := stores["hq"]
 	if hqStore == nil {
-		m.logger("Convoy: hq store unavailable, skipping convoy lookups for %s events", name)
+		if m.openStores == nil {
+			m.logger("Convoy: hq store unavailable and no re-open path, skipping convoy lookups for %s events", name)
+			return nil
+		}
+		// hq-c6ra8: the runEventPoll ticker re-invokes the store opener (with
+		// bounded backoff) until the hq store reappears, so convoy lookups
+		// resume without a daemon restart.
+		m.logger("Convoy: hq store unavailable, awaiting re-open, skipping convoy lookups for %s events", name)
 		return nil
 	}
 
