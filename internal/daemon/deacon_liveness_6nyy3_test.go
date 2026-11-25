@@ -64,10 +64,11 @@ func writeFakeProcTree(t *testing.T, rootPID, childPID int, childComm string, ch
 }
 
 // writeFakeProcStat writes /proc-style field 1..22 for the fixture pid:
-// fields 1-2 (pid, comm), then 20 more where state is index 0, utime (field
-// 14) lands at index 11, stime (field 15) at index 12, and starttime (field
-// 22) at index 19 — exactly what the production parsers slice after the
-// closing paren of comm. childCPU goes entirely into utime with stime 0.
+// fields 1-2 (pid, comm), then 20 more where state is index 0, majflt at 9,
+// cmajflt at 10, utime (field 14) at index 11, stime (field 15) at index 12,
+// and starttime (field 22) at index 19 — exactly what the production parsers
+// slice after the closing paren of comm. childCPU goes entirely into utime
+// with stime 0.
 func writeFakeProcStat(t *testing.T, childDir string, childPID int, childComm string, childCPU int64, childStartTicks uint64) {
 	t.Helper()
 	rest := make([]string, 0, 20)
@@ -76,6 +77,8 @@ func writeFakeProcStat(t *testing.T, childDir string, childPID int, childComm st
 		rest = append(rest, "1")
 	}
 	rest = append(rest,
+		"1", // field 12: majflt
+		"1", // field 13: cmajflt
 		strconv.FormatInt(childCPU, 10), // utime (field 14)
 		"0",                             // stime (field 15)
 		"1", "1", "1",                   // cutime, ctime, priority (16..18)
@@ -158,7 +161,11 @@ func probeSubtreeOnce(t *testing.T, procRoot string, panePID int, samples map[in
 		if total >= deaconCPUActivityDelta {
 			prevSample, seen := samples[pid]
 			samples[pid] = cpuSample{probe: probeID, total: total}
-			if seen && prevSample.probe != probeID && total-prevSample.total >= deaconCPUActivityDelta {
+			if !seen {
+				// First sample: significant baseline CPU = activity (hq-6nyy3).
+				return true
+			}
+			if prevSample.probe != probeID && total-prevSample.total >= deaconCPUActivityDelta {
 				return true
 			}
 		}

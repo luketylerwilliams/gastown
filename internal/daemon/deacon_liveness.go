@@ -119,7 +119,17 @@ func (d *Daemon) deaconSubtreeHasRecentActivity(sessionName string) bool {
 			prev, seen := d.deaconActivityCPU[pid]
 			d.deaconActivityCPU[pid] = cpuSample{probe: probeID, total: total}
 			d.deaconActivityMu.Unlock()
-			if seen && prev.probe != probeID && total-prev.total >= deaconCPUActivityDelta {
+			if !seen {
+				// First sample for this pid: if it already has significant CPU
+				// (the child was burning before we started watching), treat it
+				// as activity — hq-6nyy3: long-running tools that accumulated
+				// CPU before the daemon's first probe must not be invisible.
+				if total >= deaconCPUActivityDelta {
+					d.logger.Printf("Activity check: pid %d (%s) baseline %d CPU ticks — work in flight",
+						pid, name, total)
+					return true
+				}
+			} else if prev.probe != probeID && total-prev.total >= deaconCPUActivityDelta {
 				d.logger.Printf("Activity check: pid %d (%s) gained %d CPU ticks since last check — work in flight",
 					pid, name, total-prev.total)
 				return true
