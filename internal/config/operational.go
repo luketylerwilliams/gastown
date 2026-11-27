@@ -77,6 +77,13 @@ const (
 	// heartbeat has violated heartbeat discipline for far longer than the
 	// very-stale threshold).
 	DefaultDeaconBusyKillChecks            = 4
+	// DefaultDeaconConsecutiveNudgeFailures bounds the nudge-only recovery
+	// tier: a plain-Enter nudge cannot unfreeze a frozen pane (Class-B
+	// provider-edge stream hangs, 2026-11-27: 7/9 episodes failed nudges
+	// with 7-16m organic recovery). After this many consecutive NudgeSession
+	// failures the daemon force-restarts the session (kill + respawn)
+	// instead of nudging a dead pane. (hq-c4b3w)
+	DefaultDeaconConsecutiveNudgeFailures  = 3
 	DefaultMaxRedispatches                 = 3
 	DefaultRedispatchCooldown              = 5 * time.Minute
 	DefaultMaxFeedsPerCycle                = 3
@@ -498,6 +505,18 @@ func (d *DeaconThresholds) BusyKillChecksD() int {
 		}
 	}
 	return DefaultDeaconBusyKillChecks
+}
+
+// ConsecutiveNudgeFailuresV returns the configured or default consecutive
+// nudge-failure limit. (hq-c4b3w: bounds the nudge-only recovery tier before
+// the daemon force-restarts the session.)
+func (d *DeaconThresholds) ConsecutiveNudgeFailuresV() int {
+	if d != nil && d.ConsecutiveNudgeFailures != nil {
+		if *d.ConsecutiveNudgeFailures > 0 {
+			return *d.ConsecutiveNudgeFailures
+		}
+	}
+	return DefaultDeaconConsecutiveNudgeFailures
 }
 
 // MaxRedispatchesV returns the configured or default max redispatches.

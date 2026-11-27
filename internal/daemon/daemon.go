@@ -88,6 +88,18 @@ type Daemon struct {
 	deaconBusyHash   string
 	deaconBusyChecks int
 
+	// hq-c4b3w force-restart state: deaconNudgeFailures counts consecutive
+	// failed NudgeSession calls in the stale (nudge) tier. A plain-Enter
+	// nudge cannot unfreeze a frozen pane — Class-B provider-edge stream
+	// hangs (idle ESTAB provider conns, zero CPU, static pane) keep the
+	// pane content unchanged, so every nudge fails with "Enter not
+	// processed". Nudging a dead pane leaves monitoring blind for 7-16m
+	// (2026-11-27: 7/9 episodes); after ConsecutiveNudgeFailuresV()
+	// consecutive failures the daemon force-restarts the session (kill +
+	// respawn) instead. Only accessed from the heartbeat loop goroutine -
+	// no sync needed.
+	deaconNudgeFailures int
+
 	// hq-6nyy3 CPU-delta activity state: deaconActivityCPU holds the last
 	// observed cumulative CPU time per pid from the previous activity probe,
 	// and deaconActivityProbe numbers the probes so per-pid samples are only
@@ -1714,6 +1726,7 @@ func (d *Daemon) checkDeaconHeartbeat() {
 			// Reset busy state: the respawned session starts a fresh pane.
 			d.deaconBusyHash = ""
 			d.deaconBusyChecks = 0
+			d.deaconNudgeFailures = 0
 			d.restartStuckDeacon(sessionName, fmt.Sprintf("heartbeat pre-restart after %s", timeSinceStart.Round(time.Minute)))
 			return
 		}
@@ -1738,9 +1751,12 @@ func (d *Daemon) checkDeaconHeartbeat() {
 
 	// If heartbeat is fresh (below the stale threshold), nothing to do.
 	if age < thresholds.HeartbeatStaleThresholdD() {
-		// Fresh heartbeat — reset busy-aware tracking.
+		// Fresh heartbeat — reset busy-aware tracking (and the hq-c4b3w
+		// nudge-failure budget: a healthy session cannot be accumulating
+		// failed nudges).
 		d.deaconBusyHash = ""
 		d.deaconBusyChecks = 0
+		d.deaconNudgeFailures = 0
 		return
 	}
 
@@ -1809,6 +1825,7 @@ func (d *Daemon) checkDeaconHeartbeat() {
 		// Reset busy state: the respawned session starts a fresh pane.
 		d.deaconBusyHash = ""
 		d.deaconBusyChecks = 0
+		d.deaconNudgeFailures = 0
 		d.restartStuckDeacon(sessionName, fmt.Sprintf("heartbeat stale for %s", age.Round(time.Minute)))
 	} else {
 		// Stale but not very stale (5-20 min) - nudge to wake up (unless idle).
@@ -1838,8 +1855,33 @@ func (d *Daemon) checkDeaconHeartbeat() {
 
 		d.logger.Printf("Deacon stuck for %s - nudging session", age.Round(time.Minute))
 		if err := d.tmux.NudgeSession(sessionName, "HEALTH_CHECK: heartbeat stale, respond to confirm responsiveness"); err != nil {
-			d.logger.Printf("Error nudging stuck Deacon: %v", err)
+			// hq-c4b3w: a plain-Enter nudge cannot unfreeze a frozen pane.
+			// Class-B provider-edge stream hangs (idle ESTAB provider conns,
+			// zero CPU, static pane) fail verification with "Enter not
+			// processed" and stay frozen until something kills the session —
+			// 2026-11-27: 7/9 episodes self-recovered only after 7-16m,
+			// while manual 'gt deacon restart' recovered in ~2m. Count
+			// consecutive failures and force-restart (kill + respawn) once
+			// the limit is reached instead of nudging a dead pane forever.
+			d.deaconNudgeFailures++
+			limit := thresholds.ConsecutiveNudgeFailuresV()
+			d.logger.Printf("Error nudging stuck Deacon (consecutive failures: %d/%d): %v",
+				d.deaconNudgeFailures, limit, err)
+			if d.deaconNudgeFailures >= limit {
+				failed := d.deaconNudgeFailures
+				// Reset before restarting: the respawned session starts a
+				// fresh pane (busy state) and a fresh nudge budget.
+				d.deaconNudgeFailures = 0
+				d.deaconBusyHash = ""
+				d.deaconBusyChecks = 0
+				d.logger.Printf("STUCK DEACON: %d consecutive failed nudges — pane frozen, force-restarting session %s",
+					failed, sessionName)
+				d.restartStuckDeacon(sessionName, fmt.Sprintf("%d consecutive failed nudges (frozen pane)", failed))
+			}
+			return
 		}
+		// Nudge succeeded — the pane accepts input again; reset the budget.
+		d.deaconNudgeFailures = 0
 	}
 }
 

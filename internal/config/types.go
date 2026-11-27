@@ -399,6 +399,12 @@ type DeaconThresholds struct {
 	// writes. Default 4. (hq-asfp)
 	BusyKillChecks *int `json:"busy_kill_checks,omitempty"`
 
+	// ConsecutiveNudgeFailures is the number of consecutive failed nudges
+	// (plain-Enter cannot unfreeze a frozen pane) after which the daemon
+	// force-restarts the session instead of continuing to nudge. Default 3.
+	// (hq-c4b3w)
+	ConsecutiveNudgeFailures *int `json:"consecutive_nudge_failures,omitempty"`
+
 	// MaxRedispatches is max times a bead can be re-dispatched before escalating (default 3).
 	MaxRedispatches *int `json:"max_redispatches,omitempty"`
 
