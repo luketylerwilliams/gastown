@@ -51,11 +51,24 @@ type Manager struct {
 
 // NewManager creates a new deacon manager for a town.
 func NewManager(townRoot string) *Manager {
+	return NewManagerWithDeps(townRoot, tmux.NewTmux(), nudge.StartPoller, nudge.StopPoller)
+}
+
+// NewManagerWithDeps is NewManager with injectable dependencies, for callers
+// (and tests) that must override the tmux wrapper or the nudge-poller
+// lifecycle. ops nil means the real tmux wrapper; startPoller/stopPoller nil
+// disables the poller. Daemon tests use this because nudge.StartPoller
+// re-execs the running binary — under `go test` that is the test binary
+// itself (hq-c4b3w).
+func NewManagerWithDeps(townRoot string, ops tmuxOps, startPoller func(townRoot, session string) (int, error), stopPoller func(townRoot, session string) error) *Manager {
+	if ops == nil {
+		ops = tmux.NewTmux()
+	}
 	return &Manager{
 		townRoot:    townRoot,
-		tmux:        tmux.NewTmux(),
-		startPoller: nudge.StartPoller,
-		stopPoller:  nudge.StopPoller,
+		tmux:        ops,
+		startPoller: startPoller,
+		stopPoller:  stopPoller,
 	}
 }
 

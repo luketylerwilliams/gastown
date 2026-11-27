@@ -100,6 +100,13 @@ type Daemon struct {
 	// no sync needed.
 	deaconNudgeFailures int
 
+	// deaconManagerFactory builds the deacon.Manager used by
+	// ensureDeaconRunning. Defaults to deacon.NewManager when nil; tests
+	// inject a manager with stubbed pollers because nudge.StartPoller
+	// re-execs the running binary, which under `go test` is the test binary
+	// itself (hq-c4b3w).
+	deaconManagerFactory func(townRoot string) *deacon.Manager
+
 	// hq-6nyy3 CPU-delta activity state: deaconActivityCPU holds the last
 	// observed cumulative CPU time per pid from the previous activity probe,
 	// and deaconActivityProbe numbers the probes so per-pid samples are only
@@ -1566,7 +1573,11 @@ func (d *Daemon) ensureDeaconRunning() {
 		}
 	}
 
-	mgr := deacon.NewManager(d.config.TownRoot)
+	factory := d.deaconManagerFactory
+	if factory == nil {
+		factory = deacon.NewManager
+	}
+	mgr := factory(d.config.TownRoot)
 
 	if err := mgr.Start(""); err != nil {
 		if err == deacon.ErrAlreadyRunning {

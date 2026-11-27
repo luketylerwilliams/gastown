@@ -10,6 +10,7 @@ import (
 	"time"
 
 	beadsdk "github.com/steveyegge/beads"
+	"github.com/steveyegge/gastown/internal/deacon"
 )
 
 // writeFakeTmuxSimulatesPane creates a fake tmux binary that simulates a
@@ -19,6 +20,14 @@ import (
 // processed after 3 retries" — the hq-c4b3w Class-B stall signature (hung
 // model stream, zero CPU, static pane). When live, capture-pane content
 // changes on every call, so Enter is "processed" and the nudge succeeds.
+//
+// Session existence is STATEFUL via the TMUX_STATE_FILE env var (the test
+// sets it and pre-creates the file): has-session reports it, kill-session
+// removes it, new-session recreates it. Statefulness is load-bearing — after
+// restartStuckDeacon kills the session, Manager.Start must observe
+// has-session=false and take the clean-respawn path (exactly one
+// new-session). A stateless "always exists" fake makes Manager.Start return
+// ErrAlreadyRunning with no respawn.
 func writeFakeTmuxSimulatesPane(t *testing.T, dir string, frozen bool) {
 	t.Helper()
 	frozenFlag := "0"
@@ -55,7 +64,19 @@ fi
 
 case "$cmd" in
   has-session)
-    # The deacon session exists so the nudge/kill paths are reachable.
+    # Stateful: see TMUX_STATE_FILE (test pre-creates it; kill-session
+    # removes, new-session recreates).
+    if [[ -f "${TMUX_STATE_FILE:-/dev/null}" ]]; then
+      exit 0
+    fi
+    exit 1
+    ;;
+  kill-session)
+    rm -f "${TMUX_STATE_FILE:-/dev/null}"
+    exit 0
+    ;;
+  new-session)
+    : > "${TMUX_STATE_FILE:-/dev/null}"
     exit 0
     ;;
   capture-pane)
@@ -149,6 +170,13 @@ func TestCheckDeaconHeartbeat_NudgeFailForceRestart(t *testing.T) {
 			writeFakeTmuxSimulatesPane(t, fakeBinDir, true)
 			t.Setenv("PATH", fakeBinDir+string(os.PathListSeparator)+os.Getenv("PATH"))
 			t.Setenv("TMUX_LOG", tmuxLog)
+			// Stateful fake session: the deacon exists (and is frozen) at
+			// test start; kill-session/new-session in the fake track it.
+			stateFile := filepath.Join(fakeBinDir, "deacon-session-state")
+			t.Setenv("TMUX_STATE_FILE", stateFile)
+			if err := os.WriteFile(stateFile, []byte("1"), 0o644); err != nil {
+				t.Fatalf("create session state: %v", err)
+			}
 			// 10m: inside the nudge tier (stale 5m < 10m < very-stale 30m).
 			writeDeaconHeartbeat(t, townRoot, 10*time.Minute)
 
@@ -173,6 +201,16 @@ func TestCheckDeaconHeartbeat_NudgeFailForceRestart(t *testing.T) {
 			var logBuf strings.Builder
 			d.logger = log.New(&logBuf, "", 0)
 
+			// The respawn path builds a deacon.Manager inside
+			// ensureDeaconRunning. Inject a manager with the poller lifecycle
+			// stubbed: nudge.StartPoller re-execs the running binary, which
+			// under `go test` is the test binary itself. The tmux wrapper
+			// stays real so the PATH fake still observes the respawn
+			// (new-session).
+			d.deaconManagerFactory = func(townRoot string) *deacon.Manager {
+				return deacon.NewManagerWithDeps(townRoot, nil, nil, nil)
+			}
+
 			for i := 0; i < tc.frozenCalls; i++ {
 				d.checkDeaconHeartbeat()
 			}
@@ -182,13 +220,12 @@ func TestCheckDeaconHeartbeat_NudgeFailForceRestart(t *testing.T) {
 			if err != nil {
 				t.Fatalf("read tmux log: %v", err)
 			}
-			// Assert on the respawn (new-session), not the kill count: the
-			// fake has-session always reports the session as existing, so
-			// Manager.Start's kill-existing-then-respawn path issues a second
-			// kill-session (a no-op in production, where the session is
-			// already dead after restartStuckDeacon's kill). The meaningful
-			// invariant is exactly one respawn for a force-restart, zero
-			// otherwise.
+			// Assert on the respawn (new-session): the stateful fake removes
+			// the session on kill-session, so Manager.Start observes a dead
+			// session and takes the clean-respawn path (production parity —
+			// restartStuckDeacon kills before ensureDeaconRunning respawns).
+			// The meaningful invariant is exactly one respawn for a
+			// force-restart, zero otherwise.
 			respawns := 0
 			for _, line := range strings.Split(strings.TrimSpace(string(data)), "\n") {
 				if strings.HasPrefix(line, "new-session") {
@@ -236,6 +273,13 @@ func TestCheckDeaconHeartbeat_NudgeSuccessResetsBudget(t *testing.T) {
 	t.Setenv("PATH", fakeBinDir+string(os.PathListSeparator)+os.Getenv("PATH"))
 	t.Setenv("TMUX_LOG", tmuxLog)
 	t.Setenv("COUNTER_FILE", filepath.Join(t.TempDir(), "pane-counter"))
+	// Stateful fake session: the deacon exists for the whole test (the nudge
+	// tier never kills — the test asserts no kill-session happens).
+	stateFile := filepath.Join(fakeBinDir, "deacon-session-state")
+	t.Setenv("TMUX_STATE_FILE", stateFile)
+	if err := os.WriteFile(stateFile, []byte("1"), 0o644); err != nil {
+		t.Fatalf("create session state: %v", err)
+	}
 	writeDeaconHeartbeat(t, townRoot, 10*time.Minute)
 
 	d := newTestDaemonWithStores(t, townRoot, map[string]beadsdk.Storage{
@@ -246,6 +290,13 @@ func TestCheckDeaconHeartbeat_NudgeSuccessResetsBudget(t *testing.T) {
 
 	var logBuf strings.Builder
 	d.logger = log.New(&logBuf, "", 0)
+
+	// Defensive: if a regression force-restarts the session, the injected
+	// manager avoids nudge.StartPoller re-execing the test binary (whose
+	// TestMain would spin up a Dolt container).
+	d.deaconManagerFactory = func(townRoot string) *deacon.Manager {
+		return deacon.NewManagerWithDeps(townRoot, nil, nil, nil)
+	}
 
 	// 1. Frozen pane — nudge fails (budget 1/3).
 	writeFakeTmuxSimulatesPane(t, fakeBinDir, true)
