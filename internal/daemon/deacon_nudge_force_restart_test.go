@@ -28,6 +28,18 @@ import (
 // has-session=false and take the clean-respawn path (exactly one
 // new-session). A stateless "always exists" fake makes Manager.Start return
 // ErrAlreadyRunning with no respawn.
+//
+// The fake MUST stay stateless with respect to the filesystem outside the
+// test's own env-var paths: two `go test` runs of this package must never
+// contend on a shared resource. During the hq-c4b3w stall autopsy an
+// IDENTICAL-path bash fake (not this generated one) was observed blocking on
+// a hard-coded flock path via "flock -w 5"; when its parent test binary was
+// SIGQUIT-killed mid-nudge, the orphaned bash survived holding the lock,
+// and every later daemon.test run's NudgeSession hung forever in tmux.run
+// on that script (tmux.run uses a background context — no timeout, no
+// WaitDelay), reproducing the "test timed out" failures at
+// deacon_nudge_force_restart_test.go:215. Keep the fake timeout-free-fast
+// and path-isolated; never introduce a shared lock here.
 func writeFakeTmuxSimulatesPane(t *testing.T, dir string, frozen bool) {
 	t.Helper()
 	frozenFlag := "0"
