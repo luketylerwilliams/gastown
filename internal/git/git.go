@@ -626,6 +626,7 @@ func (g *Git) cloneInternal(url, dest string, opts cloneOptions) error {
 	defer func() { _ = os.RemoveAll(tmpDir) }()
 
 	tmpDest := filepath.Join(tmpDir, filepath.Base(dest))
+	needsSelfContain := false
 
 	// Build clone args
 	var args []string
@@ -670,19 +671,249 @@ func (g *Git) cloneInternal(url, dest string, opts cloneOptions) error {
 		return fmt.Errorf("moving clone to destination: %w", err)
 	}
 
+	// hq-wisp-aih: --reference-if-able records alternates pointing at the
+	// reference repo. Later fetches from the remote only extend the clone's
+	// own object store, so any object that resolves only through the
+	// alternates file (history behind a --depth shallow boundary, history a
+	// force-push hid from origin) breaks with "fatal: bad object" once the
+	// reference path — a transient local path like a rig's bare repo or a
+	// polecat worktree — is removed or replaced. Make such clones
+	// self-contained after the normal post-clone configuration. Partial
+	// clones (--filter) intentionally keep sharing objects on demand and
+	// are left untouched.
+	if opts.reference != "" && opts.branch != "" && opts.filter == "" {
+		needsSelfContain = true
+	}
+
 	// Post-clone configuration
 	if opts.bare {
 		// Configure refspec so worktrees can fetch and see origin/* refs.
 		// For single-branch shallow clones, only set the config without
 		// fetching all branches (which would defeat the purpose of --single-branch).
-		return configureRefspec(dest, opts.singleBranch)
+		if err := configureRefspec(dest, opts.singleBranch); err != nil {
+			return err
+		}
+		if needsSelfContain {
+			// Runs after configureRefspec: the graft unshallows from
+			// origin, which needs remote.origin.fetch configured.
+			selfContainQuiet(dest, opts.reference)
+		}
+		return nil
 	}
 	// Configure hooks path for Gas Town clones
 	if err := configureHooksPath(dest); err != nil {
 		return err
 	}
 	// Initialize submodules if present
-	return InitSubmodules(dest)
+	if err := InitSubmodules(dest); err != nil {
+		return err
+	}
+	if needsSelfContain {
+		selfContainQuiet(dest, opts.reference)
+	}
+	return nil
+}
+
+// selfContainQuiet runs selfContainFromReference and downgrades failures to
+// a warning: the clone stays functional as long as the reference path
+// remains valid (pre-hq-wisp-aih behavior); a failure only leaves the repo
+// dependent on the reference existing.
+func selfContainQuiet(dest, reference string) {
+	if err := selfContainFromReference(dest, reference); err != nil {
+		fmt.Printf("  Warning: could not make reference clone self-contained: %v\n", err)
+	}
+}
+
+// selfContainFromReference grafts all objects reachable from dest's refs out
+// of the reference repository and removes dest's alternates link so dest no
+// longer depends on the reference path remaining valid (hq-wisp-aih "bad
+// object" class). dest must be a single-branch clone pinned to a fixed
+// --branch, so its refs cover everything GT workflows need from the
+// reference. The graft is only attempted when an alternates file actually
+// points at the reference; if the reference was unavailable at clone time
+// (--reference-if-able skipped it) this is a no-op.
+func selfContainFromReference(dest, reference string) error {
+	gitDir := gitPathAbs("", dest)
+	if !isBareRepo(dest) {
+		gitDir = filepath.Join(gitDir, ".git")
+	}
+	altFile := filepath.Join(gitDir, "objects", "info", "alternates")
+	altData, err := os.ReadFile(altFile)
+	if os.IsNotExist(err) {
+		return nil
+	} else if err != nil {
+		return err
+	}
+
+	refAbs, err := filepath.Abs(reference)
+	if err != nil {
+		return err
+	}
+	// The alternates file stores the object-dirs referenced by the clone
+	// (typically "<reference>/objects"), not the reference path itself.
+	refObjDir := refAbs
+	if fi, err := os.Stat(refAbs); err == nil && fi.IsDir() {
+		refObjDir = filepath.Join(refAbs, "objects")
+	}
+	if resolved, err := filepath.EvalSymlinks(refObjDir); err == nil {
+		refObjDir = resolved
+	}
+	usesReference := false
+	for _, line := range strings.Split(strings.TrimSpace(string(altData)), "\n") {
+		alt := strings.TrimSpace(line)
+		if alt == "" {
+			continue
+		}
+		if !filepath.IsAbs(alt) {
+			alt = filepath.Join(gitDir, "objects", alt)
+		}
+		if abs, err := filepath.Abs(alt); err == nil {
+			if resolved, err := filepath.EvalSymlinks(abs); err == nil {
+				abs = resolved
+			}
+			if abs == refObjDir {
+				usesReference = true
+			}
+		}
+	}
+	if !usesReference {
+		return nil
+	}
+
+	// Unshallow first: a --depth clone may store no objects locally (even
+	// the boundary commit lives only in the reference), and fetch cannot
+	// deepen a shallow repo from a non-shallow local source, so the graft
+	// below would silently be satisfied through alternates and dropping the
+	// link would then corrupt the repo. --unshallow pulls the full branch
+	// history from origin while alternates are still available. A shallow
+	// origin (possible for local-path origin URLs) self-heals with
+	// --depth=... because origin's own objects stay reachable through the
+	// alternates link until the final strict verification passes.
+	isShallow := false
+	if out, err := exec.Command("git", "--git-dir", gitDir, "rev-parse", "--is-shallow-repository").Output(); err == nil {
+		isShallow = strings.TrimSpace(string(out)) == "true"
+	}
+	if isShallow {
+		unshallow := exec.Command("git", "--git-dir", gitDir, "-c", "gc.auto=0", "fetch", "--unshallow", "--no-tags", "origin")
+		if out, err := unshallow.CombinedOutput(); err != nil {
+			if !strings.Contains(strings.ToLower(string(out)), "not shallow") {
+				// Non-fatal: keep the alternates link (pre-fix behavior).
+				return fmt.Errorf("unshallowing from origin: %v: %s", err, strings.TrimSpace(string(out)))
+			}
+		}
+		if out, err := exec.Command("git", "--git-dir", gitDir, "rev-parse", "--is-shallow-repository").Output(); err == nil && strings.TrimSpace(string(out)) == "true" {
+			// Still shallow (origin is itself shallow or refuses): keep the
+			// alternates link rather than risk losing history.
+			return nil
+		}
+	}
+
+	// Fetch refs that exist in BOTH dest and the reference (intersection).
+	// A dest-only ref (e.g. a branch advanced on origin beyond the reference)
+	// would fail a plain refname fetch; a reference-only ref (e.g. stale
+	// polecat/* heads) is not needed by dest and would only bloat it.
+	out, err := exec.Command("git", "--git-dir", gitDir, "for-each-ref", "--format=%(refname)").Output()
+	if err != nil {
+		return fmt.Errorf("listing refs to graft: %w", err)
+	}
+	refOut, err := exec.Command("git", "--git-dir", reference, "for-each-ref", "--format=%(refname)").Output()
+	if err != nil {
+		return fmt.Errorf("listing reference refs: %w", err)
+	}
+	refSet := make(map[string]bool)
+	for _, line := range strings.Split(strings.TrimSpace(string(refOut)), "\n") {
+		if line = strings.TrimSpace(line); line != "" {
+			refSet[line] = true
+		}
+	}
+	// The graft fetch below can be silently satisfied through alternates
+	// (local fetches skip negotiation), so verify afterwards that every
+	// fetched tip is actually stored in the repo's own object store before
+	// dropping the link.
+	tips := make(map[string]bool)
+	var specs []string
+	for _, line := range strings.Split(strings.TrimSpace(string(out)), "\n") {
+		if line = strings.TrimSpace(line); line == "" || !refSet[line] {
+			continue
+		}
+		shaOut, err := exec.Command("git", "--git-dir", gitDir, "rev-parse", "--verify", line).Output()
+		if err != nil {
+			continue
+		}
+		tips[strings.TrimSpace(string(shaOut))] = true
+		specs = append(specs, line)
+	}
+	if len(specs) == 0 {
+		return os.Remove(altFile)
+	}
+
+	// Fetch the intersection refs from the reference into temporary refs so
+	// any object unique to the reference (e.g. history a force-push hid from
+	// origin) becomes reachable in dest.
+	for _, ref := range specs {
+		graft := exec.Command("git", "--git-dir", gitDir, "-c", "gc.auto=0", "fetch", "--no-tags", "--no-write-fetch-head", "--force", "--update-head-ok", reference, ref+":refs/gt-graft/"+strings.TrimPrefix(ref, "refs/"))
+		if out, err := graft.CombinedOutput(); err != nil {
+			// Non-fatal for individual refs: origin-supplied history was
+			// already unshallowed above; tip verification below decides.
+			_ = out
+		}
+	}
+	defer func() {
+		if out, err := exec.Command("git", "--git-dir", gitDir, "for-each-ref", "--format=%(refname)", "refs/gt-graft").Output(); err == nil {
+			for _, line := range strings.Split(strings.TrimSpace(string(out)), "\n") {
+				if line = strings.TrimSpace(line); line != "" {
+					_ = exec.Command("git", "--git-dir", gitDir, "update-ref", "-d", line).Run()
+				}
+			}
+		}
+	}()
+
+	// Merge alternates into dest's own object store. `repack -a -d` with
+	// alternates configured copies alternate objects into a local pack
+	// ("merge alternates" mode).
+	repack := exec.Command("git", "--git-dir", gitDir, "-c", "gc.auto=0", "repack", "-a", "-d")
+	if out, err := repack.CombinedOutput(); err != nil {
+		return fmt.Errorf("merging reference objects into %s: %v: %s", gitDir, err, strings.TrimSpace(string(out)))
+	}
+
+	// Every ref tip must now resolve in dest's own object store. An empty
+	// GIT_ALTERNATE_OBJECT_DIRECTORIES makes git ignore the alternates file,
+	// giving a strict local-only check.
+	strictEnv := append(os.Environ(), "GIT_ALTERNATE_OBJECT_DIRECTORIES=")
+	for sha := range tips {
+		r := exec.Command("git", "--git-dir", gitDir, "cat-file", "-e", sha+"^{commit}")
+		r.Env = strictEnv
+		if err := r.Run(); err != nil {
+			// The reference could not supply the object locally; keeping
+			// the alternates link (pre-fix behavior) is safer than
+			// corrupting the repo.
+			return fmt.Errorf("ref object %s not grafted from reference", sha)
+		}
+	}
+
+	// Drop the alternates link so the repo no longer depends on the
+	// reference path existing.
+	return os.Remove(altFile)
+}
+
+// isBareRepo reports whether dir is a bare repository (has an objects dir
+// directly under dir, or a gitdir pointer into one).
+func isBareRepo(dir string) bool {
+	if fi, err := os.Stat(filepath.Join(dir, "objects")); err == nil && fi.IsDir() {
+		return true
+	}
+	// Linked worktrees of a bare repo store a gitdir pointer file.
+	if data, err := os.ReadFile(filepath.Join(dir, "gitdir")); err == nil {
+		ptr := strings.TrimSpace(string(data))
+		if ptr != "" {
+			if !filepath.IsAbs(ptr) {
+				ptr = filepath.Join(dir, ptr)
+			}
+			_, err := os.Stat(filepath.Join(ptr, "objects"))
+			return err == nil
+		}
+	}
+	return false
 }
 
 // Clone clones a repository to the destination.

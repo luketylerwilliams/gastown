@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **Reference clones no longer depend on the reference path surviving**
+  (`hq-wisp-aih` "git fatal: bad object" class). `gt rig add` / mayor / crew
+  clones created with `--reference-if-able` recorded git alternates pointing
+  at a transient local path (a rig's bare repo or a polecat worktree). Any
+  object that resolved only through that link — history behind the `--depth`
+  shallow boundary, or history a force-push hid from origin — broke with
+  `fatal: bad object` once the reference was removed or replaced (observed
+  as `rig add <url> failed and cleaned up mayor/rig: is a repository`).
+  Such clones are now made self-contained at creation: unshallow from
+  origin, fetch the reference's intersecting refs into temp refs, merge the
+  alternates via `repack -a -d`, verify every ref tip is stored locally with
+  alternates disabled, and only then drop the alternates link. Verification
+  failure keeps the old behavior (link retained) rather than risk data loss.
+
 ### Changed
 
 - **Dolt 2.6.0 is now the minimum supported version** (was 2.0.7). `gt install`
